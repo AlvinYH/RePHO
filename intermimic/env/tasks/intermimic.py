@@ -867,10 +867,20 @@ class InterMimic(Humanoid_SMPLX):
         return
     
     def _reset_target(self, env_ids):
-        self._target_states[env_ids, :3] = self.extract_ref_component('obj_pos', self.data_id[env_ids], self.ref_index[env_ids], self.progress_buf[env_ids])
-        self._target_states[env_ids, 3:7] = self.extract_ref_component('obj_rot', self.data_id[env_ids], self.ref_index[env_ids], self.progress_buf[env_ids])
-        self._target_states[env_ids, 7:10] = self.extract_ref_component('obj_pos_vel', self.data_id[env_ids], self.ref_index[env_ids], self.progress_buf[env_ids])
-        self._target_states[env_ids, 10:13] = self.extract_ref_component('obj_rot_vel', self.data_id[env_ids], self.ref_index[env_ids], self.progress_buf[env_ids])
+        device = self._target_states.device
+        reference = {
+            name: self.extract_ref_component(
+                name,
+                self.data_id[env_ids],
+                self.ref_index[env_ids],
+                self.progress_buf[env_ids],
+            ).to(device)
+            for name in ("obj_pos", "obj_rot", "obj_pos_vel", "obj_rot_vel")
+        }
+        self._target_states[env_ids, :3] = reference["obj_pos"]
+        self._target_states[env_ids, 3:7] = reference["obj_rot"]
+        self._target_states[env_ids, 7:10] = reference["obj_pos_vel"]
+        self._target_states[env_ids, 10:13] = reference["obj_rot_vel"]
         return  
 
     def _reset_env_tensors(self, env_ids):
@@ -948,19 +958,24 @@ class InterMimic(Humanoid_SMPLX):
 
         config_json_path = os.path.join(self.cam_img_dir, 'config.json')
         val_config = json.load(open(config_json_path, 'r'))
+        task = val_config.get('task', 'InterMimic')
+        sub_file_name = val_config.get('sub_file_name', 'intermimic_vistracker')
+        validation_gpu_id = val_config.get('validation_gpu_id', val_config['gpu_id'])
 
         rewards_val = (self.ref_reward[0].clone() - 7).clamp(min=0).sum(dim=0)
         init_range_left_val_candidate = rewards_val.argmax()
         init_range_left_val = 0 if rewards_val[0] > rewards_val[init_range_left_val_candidate]-10 else init_range_left_val_candidate
         if not self.reverse_time:
-            command = f'bash scripts/train_dual_forward_val.sh {val_config["seq_name"]} {val_config["gpu_id"]} {val_config["out_root"]} {val_config["motion_root"]} {val_config["cfg_env"]} {val_config["cfg_train"]} {self.curr_epoch} {init_range_left_val}'
+            command = f'bash scripts/train_dual_forward_val.sh {val_config["seq_name"]} {validation_gpu_id} {val_config["out_root"]} {val_config["motion_root"]} {val_config["cfg_env"]} {val_config["cfg_train"]} {self.curr_epoch} {init_range_left_val} {task} {sub_file_name}'
         else:
             forward_data = os.path.join(self.cam_img_dir, 'ref_tar', f'ref_tar_{self.curr_epoch}','intermimic.pt').replace('backward','forward')
             while not os.path.exists(forward_data):
                 time.sleep(2)
             time.sleep(10)
-            command = f'bash scripts/train_dual_backward_val.sh {val_config["seq_name"]} {val_config["gpu_id"]} {val_config["out_root"]} {val_config["motion_root"]} {val_config["cfg_env"]} {val_config["cfg_train"]} {self.curr_epoch} {init_range_left_val}'
-        os.system(command)
+            command = f'bash scripts/train_dual_backward_val.sh {val_config["seq_name"]} {validation_gpu_id} {val_config["out_root"]} {val_config["motion_root"]} {val_config["cfg_env"]} {val_config["cfg_train"]} {self.curr_epoch} {init_range_left_val} {task} {sub_file_name}'
+        return_code = os.system(command)
+        if return_code != 0:
+            raise RuntimeError(f'RePHO validation failed with status {return_code}: {command}')
         
         print(f'run val with command: {command}')
 
@@ -1491,6 +1506,12 @@ class InterMimic(Humanoid_SMPLX):
 
 
     def _set_env_state(self, env_ids, root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel):
+        device = self._humanoid_root_states.device
+        env_ids = env_ids.to(device)
+        root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel = (
+            value.to(device)
+            for value in (root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel)
+        )
         self._humanoid_root_states[env_ids, 0:3] = root_pos
         self._humanoid_root_states[env_ids, 3:7] = root_rot
         self._humanoid_root_states[env_ids, 7:10] = root_vel
