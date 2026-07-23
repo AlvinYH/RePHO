@@ -221,6 +221,7 @@ def _task(seed: int, contact_mode: str):
         rollout_length=frames,
         kinematic_reset=torch.zeros(envs, dtype=torch.bool, device=device),
         contact_reset=torch.zeros((envs, 5), device=device),
+        _all_env_ids=torch.arange(envs, device=device),
         psi=5,
         to_end_cnt=49,
         middle_to_end_cnt=0,
@@ -301,6 +302,111 @@ def _clone(task):
     return clone
 
 
+def _check_single_motion_sampling() -> None:
+    env_ids = torch.arange(257, device="cuda")
+    obj2motion = torch.ones((1, 1), dtype=torch.bool, device="cuda")
+    cdf = torch.linspace(0.01, 1.0, 101, device="cuda")
+    task = SimpleNamespace(
+        num_motions=1,
+        device="cuda",
+        object_name=["object"],
+        obj2motion=obj2motion,
+        cal_cdf=lambda motion_ids, row: cdf,
+    )
+    for mask_kind in ("all_random", "hybrid"):
+        for seed in range(4):
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            old_ids = torch.stack(
+                [
+                    torch.where(obj2motion[0])[0][
+                        torch.randint(obj2motion[0].sum(), ())
+                    ]
+                    for _ in env_ids
+                ]
+            ).to("cuda")
+            if mask_kind == "all_random":
+                old_mask = False
+                reset_ids = env_ids[False]
+            else:
+                old_mask = torch.bernoulli(
+                    torch.full((len(env_ids),), 0.1, device="cuda")
+                ).bool()
+                reset_ids = env_ids[old_mask]
+            old_times = torch.cat(
+                [
+                    torch.searchsorted(cdf, torch.rand(1).to("cuda"))
+                    if env_id not in reset_ids
+                    else torch.zeros(1, device="cuda", dtype=torch.long)
+                    for env_id in env_ids
+                ]
+            )
+            old_cpu_state = torch.get_rng_state()
+            old_cuda_state = torch.cuda.get_rng_state()
+
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            new_ids = InterMimic._sample_motion_ids(task, env_ids)
+            if mask_kind == "all_random":
+                new_mask = False
+            else:
+                new_mask = torch.bernoulli(
+                    torch.full((len(env_ids),), 0.1, device="cuda")
+                ).bool()
+            new_times = InterMimic._sample_hybrid_motion_times(
+                task, new_ids, env_ids, new_mask
+            )
+            if not torch.equal(old_ids, new_ids):
+                raise AssertionError("single-motion IDs changed")
+            if not torch.equal(old_times, new_times):
+                raise AssertionError(f"{mask_kind} samples changed")
+            if not torch.equal(old_cpu_state, torch.get_rng_state()):
+                raise AssertionError(f"{mask_kind} CPU RNG state changed")
+            if not torch.equal(old_cuda_state, torch.cuda.get_rng_state()):
+                raise AssertionError(f"{mask_kind} CUDA RNG state changed")
+
+
+def _check_interaction_reset_dead_code() -> None:
+    task = SimpleNamespace(_key_body_ids=torch.arange(5, device="cuda"))
+    key_pos = torch.randn((32, 5, 3), device="cuda")
+    ref_key_pos = torch.randn_like(key_pos)
+    obj_points = torch.randn((32, 17, 3), device="cuda")
+    ref_obj_points = torch.randn_like(obj_points)
+    for weight in (0.0, 3.0):
+        rig, reset = InterMimic.compute_ig_reward(
+            task,
+            {"ig": weight},
+            key_pos,
+            ref_key_pos,
+            obj_points,
+            ref_obj_points,
+        )
+        ig = key_pos.unsqueeze(2) - obj_points.unsqueeze(1)
+        ref_ig = ref_key_pos.unsqueeze(2) - ref_obj_points.unsqueeze(1)
+        weight_1 = 1 / torch.clamp((ig ** 2).sum(dim=-1), min=0.01)
+        weight_1 /= weight_1.sum(dim=-1, keepdim=True).sum(
+            dim=-2, keepdim=True
+        )
+        weight_2 = 1 / torch.clamp((ref_ig ** 2).sum(dim=-1), min=0.01)
+        weight_2 /= weight_2.sum(dim=-1, keepdim=True).sum(
+            dim=-2, keepdim=True
+        )
+        error = ((ig - ref_ig) ** 2).sum(dim=-1) * (
+            weight_1 + weight_2
+        )
+        expected = (
+            torch.exp(
+                -weight * (error.sum(dim=-1).sum(dim=-1) * 0.5)
+            )
+            if weight > 0
+            else torch.full_like(rig, 0.1)
+        )
+        if not torch.equal(rig, expected):
+            raise AssertionError("interaction reward changed")
+        if torch.any(reset):
+            raise AssertionError("dead interaction reset was not false")
+
+
 def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -340,6 +446,8 @@ def main() -> None:
                     raise AssertionError(
                         f"{name} mismatch at {contact_mode}/{seed}"
                     )
+    _check_single_motion_sampling()
+    _check_interaction_reset_dead_code()
     with tempfile.TemporaryDirectory(dir="/tmp") as directory:
         root = Path(directory)
         arrays = {
@@ -404,6 +512,8 @@ def main() -> None:
     print("RePHO reference update: exact CUDA tensor parity")
     print("RePHO atomic artifacts: exact tensor/array parity")
     print("RePHO SDF/history buffers: exact CUDA tensor parity")
+    print("RePHO single-motion sampling: exact RNG/tensor parity")
+    print("RePHO dead reset removal: exact CUDA tensor parity")
 
 
 if __name__ == "__main__":

@@ -29,8 +29,6 @@
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from rl_games.algos_torch import torch_ext
 from rl_games.common import a2c_common
-import psutil
-import subprocess
 from isaacgym.torch_utils import *
 
 import time
@@ -198,16 +196,10 @@ class InterMimicAgent(common_agent.CommonAgent):
 
             self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
 
-            invalid_obs = ~torch.isfinite(self.obs['obs'])  # True where obs is NaN or infinite
-            invalid_batches = torch.any(invalid_obs, dim=1)  # Check if any invalid number in each batch (B, N)
-
-            if torch.any(invalid_obs):
-                print("invalid observation")
-                print(torch.where(invalid_obs))
-                self.obs['obs'][invalid_batches] = 0
-            # Set self.dones to True for batches with invalid observations
-                self.dones[invalid_batches] = True
-                infos['terminate'][invalid_batches] = True
+            invalid_batches = ~torch.isfinite(self.obs['obs']).all(dim=1)
+            self.obs['obs'][invalid_batches] = 0
+            self.dones[invalid_batches] = True
+            infos['terminate'][invalid_batches] = True
 
             shaped_rewards = self.rewards_shaper(rewards)
             # shaped_rewards = shaped_rewards * (((res_dict['actions'] - res_dict['mus'])**2).sum(dim=-1).mul(-0.01).exp().unsqueeze(-1))
@@ -577,24 +569,6 @@ class InterMimicAgent(common_agent.CommonAgent):
         super()._record_train_batch_info(batch_dict, train_info)
         return
     
-    def get_cpu_usage(self):
-        return psutil.cpu_percent(interval=None)
-
-    def get_cpu_memory_usage(self):
-        return psutil.virtual_memory().percent
-    
-    def get_gpu_usage(self):
-        result = subprocess.run(
-            [
-                'nvidia-smi',
-                '--query-gpu=utilization.gpu,memory.used',
-                '--format=csv,noheader,nounits',
-            ],
-            stdout=subprocess.PIPE,
-        )
-        usage, memory = result.stdout.decode().strip().splitlines()[0].split(',')
-        return int(usage.strip()), int(memory.strip())
-
     def _log_train_info(self, train_info, frame):
         self.writer.add_scalar('performance/update_time', train_info['update_time'], frame)
         self.writer.add_scalar('performance/play_time', train_info['play_time'], frame)
@@ -609,11 +583,6 @@ class InterMimicAgent(common_agent.CommonAgent):
         self.writer.add_scalar('info/clip_frac', torch_ext.mean_list(train_info['actor_clip_frac']).item(), frame)
         self.writer.add_scalar('info/kl', torch_ext.mean_list(train_info['kl']).item(), frame)
 
-        gpu_usage, gpu_memory = self.get_gpu_usage()
-        self.writer.add_scalar('usage/cpu', self.get_cpu_usage(), frame)
-        self.writer.add_scalar('usage/gpu', gpu_usage, frame)
-        self.writer.add_scalar('usage/cpu_memory', self.get_cpu_memory_usage(), frame)
-        self.writer.add_scalar('usage/gpu_memory', gpu_memory, frame)
         return
 
     def _log_train_epoch(self, train_info, frame):

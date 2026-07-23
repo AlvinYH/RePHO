@@ -153,6 +153,14 @@ class InterMimic(Humanoid_SMPLX):
 
 
         self._build_target_tensors()
+        self.left_hand_ids = tuple(range(17, 33))
+        self.right_hand_ids = tuple(range(36, 52))
+        hand_ids = set(self.left_hand_ids + self.right_hand_ids)
+        self._other_contact_body_ids = tuple(
+            body_id
+            for body_id in range(len(self.contact_bodies))
+            if body_id not in hand_ids
+        )
         self.cam_img_dir = cfg['env']['cam_img_dir']
         self.contact_obj_whole = self.extract_data_component('contact_obj', obs=self.hoi_data[0, 0:self.max_episode_length[0]])
 
@@ -464,54 +472,40 @@ class InterMimic(Humanoid_SMPLX):
             'obj_pos', 'obj_rot', 'obj_pos_vel', 'obj_rot_vel', 'ig', 'contact_human', 'contact_obj'
         ]
 
-        # Precompute the sizes for each component.
-        data_component_sizes = [
-            loaded_dict[name].shape[1]
-            for name in self.data_component_order
-        ]
-
-        # Precompute cumulative indices. The first index is zero.
-        # For each i, calculate the sum of component_sizes[:i] to determine the starting index for that component.
-        self.data_component_index = [sum(data_component_sizes[:i]) for i in range(len(data_component_sizes) + 1)]
+        start = 0
+        self.data_component_slices = {}
+        for name in self.data_component_order:
+            end = start + loaded_dict[name].shape[1]
+            self.data_component_slices[name] = slice(start, end)
+            start = end
 
         self.ref_component_order = [
             'root_pos', 'root_rot', 'root_pos_vel', 'root_rot_vel', 'dof_pos', 'dof_vel', 'obj_pos', 'obj_rot', 
             'obj_pos_vel', 'obj_rot_vel'
         ]
 
-        # Precompute the sizes for each component.
-        ref_component_sizes = [
-            loaded_dict[name].shape[1]
-            for name in self.ref_component_order
-        ]
-
-        # Precompute cumulative indices. The first index is zero.
-        # For each i, calculate the sum of component_sizes[:i] to determine the starting index for that component.
-        self.ref_component_index = [sum(ref_component_sizes[:i]) for i in range(len(ref_component_sizes) + 1)]
+        start = 0
+        self.ref_component_slices = {}
+        for name in self.ref_component_order:
+            end = start + loaded_dict[name].shape[1]
+            self.ref_component_slices[name] = slice(start, end)
+            start = end
 
 
     def extract_ref_component(self, var_name, data_id, ref_index, t):
-        index = self.ref_component_order.index(var_name)
-        
-        # The number of columns to extract for this component.
-        start = self.ref_component_index[index]
-        end = self.ref_component_index[index+1]
-        
-        return self.hoi_refs[data_id, ref_index, t, start:end]
+        return self.hoi_refs[
+            data_id, ref_index, t, self.ref_component_slices[var_name]
+        ]
 
 
     def extract_data_component(self, var_name, ref=False, data_id=None, t=None, obs=None):
-        index = self.data_component_order.index(var_name)
-        
-        # The number of columns to extract for this component.
-        start = self.data_component_index[index]
-        end = self.data_component_index[index+1]
-        
         if ref and data_id is not None and t is not None:
-            return self.hoi_data[data_id, t, start:end]
+            return self.hoi_data[
+                data_id, t, self.data_component_slices[var_name]
+            ]
         
         if obs is not None:
-            return obs[..., start:end]
+            return obs[..., self.data_component_slices[var_name]]
 
     def _create_envs(self, num_envs, spacing, num_per_row):
 
@@ -928,11 +922,9 @@ class InterMimic(Humanoid_SMPLX):
             to_draw = False
         os.makedirs(self.cam_img_dir+'/ref_reward', exist_ok=True)
         os.makedirs(self.cam_img_dir+'/ref_hoi', exist_ok=True)
-        os.makedirs(self.cam_img_dir+'/ref_contact', exist_ok=True)
         file_path = os.path.join(self.cam_img_dir, 'ref_reward',f'ref_reward_{epoch}.npz')
         file_path_for_opposite = os.path.join(self.cam_img_dir, 'ref_reward',f'opposite_ref_reward_{epoch}.npz')
         file_path_for_hoi = os.path.join(self.cam_img_dir, 'ref_hoi',f'ref_hoi_{epoch}.npz')
-        file_path_for_contact = os.path.join(self.cam_img_dir, 'ref_contact',f'ref_contact_{epoch}.npz')
         file_path_for_hoi_opposite = os.path.join(self.cam_img_dir, 'ref_hoi',f'opposite_ref_hoi_{epoch}.npz')
         indices_for_velocity = list(range(7, 13)) + list(range(166, 319)) + list(range(326, 332))
         if self.reverse_time:
@@ -949,7 +941,6 @@ class InterMimic(Humanoid_SMPLX):
             hoi_refs_for_save[:, :, :, indices_for_velocity] *= -1
             _atomic_savez(file_path_for_hoi_opposite, hoi_refs=hoi_refs_for_opposite_for_save.flip(2).cpu().numpy())
             _atomic_savez(file_path_for_hoi, hoi_refs=hoi_refs_for_save.flip(2).cpu().numpy())
-            _atomic_savez(file_path_for_contact, contact_refs=self.contact_refs.flip(2).cpu().numpy()[:,:,140:170])
         else:
             _atomic_savez(file_path, ref_reward=self.ref_reward.cpu().numpy())
 
@@ -958,7 +949,6 @@ class InterMimic(Humanoid_SMPLX):
 
             _atomic_savez(file_path_for_hoi_opposite, hoi_refs=torch.cat([self.hoi_refs_for_opposite,self.contact_refs_for_opposite], dim=-1).cpu().numpy())
             _atomic_savez(file_path_for_hoi, hoi_refs=torch.cat([self.hoi_refs,self.contact_refs], dim=-1).cpu().numpy())
-            _atomic_savez(file_path_for_contact, contact_refs=self.contact_refs.cpu().numpy()[:,:,140:170])
         if epoch % 100 == 0:
             os.makedirs(self.cam_img_dir+'/hoi_data', exist_ok=True)
 
@@ -1262,7 +1252,7 @@ class InterMimic(Humanoid_SMPLX):
     def _reset_ref_state_init(self, env_ids):
         num_envs = env_ids.shape[0]
 
-        i = to_torch([torch.where(self.obj2motion[i % len(self.object_name)] == 1)[0][torch.randint(self.obj2motion[i % len(self.object_name)].sum(), ())] for i in env_ids], device=self.device, dtype=torch.long)
+        i = self._sample_motion_ids(env_ids)
 
         if (self._state_init == InterMimic.StateInit.Random
             or self._state_init == InterMimic.StateInit.Hybrid):
@@ -1308,6 +1298,30 @@ class InterMimic(Humanoid_SMPLX):
                             )
 
         return
+
+    def _sample_motion_ids(self, env_ids):
+        if self.num_motions == 1:
+            # Preserve the upstream CPU RNG stream while avoiding one GPU scalar
+            # synchronization per environment.
+            torch.randint(1, (env_ids.shape[0],))
+            return torch.zeros_like(env_ids, device=self.device)
+        return to_torch(
+            [
+                torch.where(
+                    self.obj2motion[env_id % len(self.object_name)] == 1
+                )[0][
+                    torch.randint(
+                        self.obj2motion[
+                            env_id % len(self.object_name)
+                        ].sum(),
+                        (),
+                    )
+                ]
+                for env_id in env_ids
+            ],
+            device=self.device,
+            dtype=torch.long,
+        )
 
     def cal_cdf(self, i, e):
         """
@@ -1372,7 +1386,7 @@ class InterMimic(Humanoid_SMPLX):
         
         # For each environment, randomly select a motion sequence that matches its object type
         # obj2motion is a boolean mask indicating which motions are compatible with each object
-        i = to_torch([torch.where(self.obj2motion[i % len(self.object_name)] == 1)[0][torch.randint(self.obj2motion[i % len(self.object_name)].sum(), ())] for i in env_ids], device=self.device, dtype=torch.long)
+        i = self._sample_motion_ids(env_ids)
         
         # Create probability array for hybrid initialization (mix of reference and random starts)
         ref_probs = to_torch(np.array([self._hybrid_init_prob] * num_envs), device=self.device)
@@ -1381,13 +1395,9 @@ class InterMimic(Humanoid_SMPLX):
         ref_init_mask = torch.bernoulli(ref_probs) == 1.0
 
         ref_init_mask = False
-        # Get the IDs of environments that will use reference initialization
-        ref_reset_ids = env_ids[ref_init_mask]
-
-        # For each environment, determine the starting time in the motion sequence:
-        # - If in ref_reset_ids: start from time 0 (beginning of motion)
-        # - Otherwise: sample time from CDF based on historical success (curriculum learning)
-        motion_times = torch.cat([torch.searchsorted(self.cal_cdf(i, e), torch.rand(1).to(self.device)) if env_ids[e] not in ref_reset_ids else torch.zeros((1,), device=self.device, dtype=torch.long) for e in range(num_envs)])
+        motion_times = self._sample_hybrid_motion_times(
+            i, env_ids, ref_init_mask
+        )
         
         # Get the reference rewards for the selected motions at the chosen time steps
         # Shape: [num_envs, num_reference_trajectories]
@@ -1444,7 +1454,7 @@ class InterMimic(Humanoid_SMPLX):
         
         # For each environment, randomly select a motion sequence that matches its object type
         # obj2motion is a boolean mask indicating which motions are compatible with each object
-        i = to_torch([torch.where(self.obj2motion[i % len(self.object_name)] == 1)[0][torch.randint(self.obj2motion[i % len(self.object_name)].sum(), ())] for i in env_ids], device=self.device, dtype=torch.long)
+        i = self._sample_motion_ids(env_ids)
         
         # Create probability array for hybrid initialization (mix of reference and random starts)
         ref_probs = to_torch(np.array([self._hybrid_init_prob] * num_envs), device=self.device)
@@ -1452,13 +1462,9 @@ class InterMimic(Humanoid_SMPLX):
         # Randomly determine which environments will use reference initialization (True) vs random (False)
         ref_init_mask = torch.bernoulli(ref_probs) == 1.0
 
-        # Get the IDs of environments that will use reference initialization
-        ref_reset_ids = env_ids[ref_init_mask]
-
-        # For each environment, determine the starting time in the motion sequence:
-        # - If in ref_reset_ids: start from time 0 (beginning of motion)
-        # - Otherwise: sample time from CDF based on historical success (curriculum learning)
-        motion_times = torch.cat([torch.searchsorted(self.cal_cdf(i, e), torch.rand(1).to(self.device)) if env_ids[e] not in ref_reset_ids else torch.zeros((1,), device=self.device, dtype=torch.long) for e in range(num_envs)]) 
+        motion_times = self._sample_hybrid_motion_times(
+            i, env_ids, ref_init_mask
+        )
         
         # Get the reference rewards for the selected motions at the chosen time steps
         # Shape: [num_envs, num_reference_trajectories]
@@ -1501,6 +1507,41 @@ class InterMimic(Humanoid_SMPLX):
                             dof_vel=self.extract_ref_component('dof_vel', i, idx, motion_times),
                             )
         return
+
+    def _sample_hybrid_motion_times(self, motion_ids, env_ids, ref_init_mask):
+        if self.num_motions == 1:
+            if isinstance(ref_init_mask, bool):
+                random_mask = torch.full(
+                    env_ids.shape,
+                    not ref_init_mask,
+                    device=self.device,
+                    dtype=torch.bool,
+                )
+                random_count = env_ids.shape[0] if not ref_init_mask else 0
+            else:
+                random_mask = ~ref_init_mask
+                random_count = int(random_mask.sum().item())
+            random_values = torch.rand(random_count)
+            motion_times = torch.zeros_like(env_ids, device=self.device)
+            motion_times[random_mask] = torch.searchsorted(
+                self.cal_cdf(motion_ids, 0),
+                random_values.to(self.device),
+            )
+            return motion_times
+        ref_reset_ids = env_ids[ref_init_mask]
+        return torch.cat(
+            [
+                torch.searchsorted(
+                    self.cal_cdf(motion_ids, row),
+                    torch.rand(1).to(self.device),
+                )
+                if env_ids[row] not in ref_reset_ids
+                else torch.zeros(
+                    (1,), device=self.device, dtype=torch.long
+                )
+                for row in range(env_ids.shape[0])
+            ]
+        )
 
 
 
@@ -2055,7 +2096,7 @@ class InterMimic(Humanoid_SMPLX):
         else:
             self.contact_reset = (self.contact_reset + contact_reset)
         self.kinematic_reset = torch.logical_or(ig_reset, kinematic_reset)
-        index = torch.arange(self._curr_reward.shape[0])
+        index = self._all_env_ids
 
         self.reward_components = {
             'humanoid_reward': rb,
@@ -2066,14 +2107,8 @@ class InterMimic(Humanoid_SMPLX):
         }
 
 
-        try:
-            if torch.isnan(self.rew_buf).any() or torch.isinf(self.rew_buf).any():
-                print("NaN/inf detected in reward buffer")
-
-            self._curr_reward[index, self.progress_buf - self.start_times] = self.rew_buf
-            self._sum_reward[index] += self.rew_buf * 0.99
-        except:
-            print('error')
+        self._curr_reward[index, self.progress_buf - self.start_times] = self.rew_buf
+        self._sum_reward[index] += self.rew_buf * 0.99
 
         self._curr_state[index, self.progress_buf - self.start_times, :] = torch.cat([
             self._humanoid_root_states, #0:13
@@ -2350,9 +2385,6 @@ class InterMimic(Humanoid_SMPLX):
         return ro, object_reset, obj_points, ref_obj_points
     
     def compute_contact_chamfer_reward(self, w, all_pos, ref_all_pos, obj_points, ref_obj_points):
-        self.left_hand_ids = list(range(17, 33))
-        self.right_hand_ids = list(range(36, 52))
-
         left_hand_contact_any_ref = self.contact_label_left_hand[self.progress_buf]
         right_hand_contact_any_ref = self.contact_label_right_hand[self.progress_buf]
         hand_pos = all_pos[:,self.left_hand_ids+self.right_hand_ids]
@@ -2415,22 +2447,18 @@ class InterMimic(Humanoid_SMPLX):
         else:
             rig = torch.ones_like(eig.sum(dim=-1).sum(dim=-1)) * 0.1
 
-        reset_ig_1 = (((ig - ref_ig)**2).sum(dim=-1).sqrt() / torch.clamp((ref_ig**2).sum(dim=-1).sqrt(), min=0.5)).max(dim=-1)[0].max(dim=-1)[0] > 2
-        reset_ig_2 = (((ig - ref_ig)**2).sum(dim=-1).sqrt() / torch.clamp((ig**2).sum(dim=-1).sqrt(), min=0.5)).max(dim=-1)[0].max(dim=-1)[0] > 2
-        reset_ig = torch.logical_or(reset_ig_1, reset_ig_2)
-        reset_ig = torch.zeros_like(reset_ig)
-        return rig, reset_ig
+        return rig, torch.zeros_like(rig, dtype=torch.bool)
     
     def compute_cg_reward(self, w):    
         contact_thres = 0.1
         ref_human_contact = self.extract_data_component('contact_human', obs=self._curr_ref_obs)
         human_contact = self.extract_data_component('contact_human', obs=self._curr_obs)
-        left_contact_hand_ids = list(range(17, 33))
+        left_contact_hand_ids = self.left_hand_ids
 
         
         ref_left_contact_hand = ref_human_contact[:, left_contact_hand_ids]
         ref_left_contact_hand_any = torch.any(ref_left_contact_hand > contact_thres, dim=-1).float()
-        left_hand_contact = human_contact[:, left_contact_hand_ids].clone()
+        left_hand_contact = human_contact[:, left_contact_hand_ids]
         left_hand_contact_any_finger = torch.any(left_hand_contact[:,1:13] > contact_thres, dim=-1, keepdim=True).float()
         left_hand_contact_any_palm = torch.any(left_hand_contact[:,:1] > contact_thres, dim=-1, keepdim=True).float()
 
@@ -2438,11 +2466,11 @@ class InterMimic(Humanoid_SMPLX):
         rcg_left = 0.5 * (1 + torch.exp(-ecg_left*w['cg_hand'])) * (ref_left_contact_hand_any) + (1 - ref_left_contact_hand_any)
 
 
-        right_contact_hand_ids = list(range(36, 52))
+        right_contact_hand_ids = self.right_hand_ids
         
         ref_right_contact_hand = ref_human_contact[:, right_contact_hand_ids]
         ref_right_contact_hand_any = torch.any(ref_right_contact_hand > contact_thres, dim=-1).float()
-        right_hand_contact = human_contact[:, right_contact_hand_ids].clone()
+        right_hand_contact = human_contact[:, right_contact_hand_ids]
         right_hand_contact_any_finger = torch.any(right_hand_contact[:,1:13] > contact_thres, dim=-1, keepdim=True).float()
         right_hand_contact_any_palm = torch.any(right_hand_contact[:,:1] > contact_thres, dim=-1, keepdim=True).float()
 
@@ -2459,9 +2487,8 @@ class InterMimic(Humanoid_SMPLX):
         
         rcg_hand = rcg_left * rcg_right
 
-        other_ids = [i for i in range(len(self.contact_bodies)) if i not in left_contact_hand_ids and i not in right_contact_hand_ids]
-        ref_other_contact = ref_human_contact[:, other_ids]
-        other_contact = human_contact[:, other_ids]
+        ref_other_contact = ref_human_contact[:, self._other_contact_body_ids]
+        other_contact = human_contact[:, self._other_contact_body_ids]
         ecg_other = ((torch.abs(other_contact - ref_other_contact) * (ref_other_contact > contact_thres))).mean(dim=-1)
         rcg_other = torch.exp(-ecg_other*w['cg_other'])
         
@@ -2469,7 +2496,7 @@ class InterMimic(Humanoid_SMPLX):
         ecg_all = (torch.abs(no_contact + ref_human_contact) * (ref_human_contact < -contact_thres)).mean(dim=-1)
         rcg_all = torch.exp(-ecg_all*w['cg_all'])
 
-        contact_all = self._contact_forces.clone().abs().sum(dim=-1).sum(dim=-1)
+        contact_all = self._contact_forces.abs().sum(dim=-1).sum(dim=-1)
         contact_energy = contact_all.pow(2).mul(-w['eg3']).exp()
 
         rcg = rcg_hand*rcg_other*rcg_all*contact_energy

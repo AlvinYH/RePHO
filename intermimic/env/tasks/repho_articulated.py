@@ -214,6 +214,7 @@ class RePHOArticulated(InterMimic):
         self._art_rollout_terminated = None
         self._last_env0_reset_qpos = None
         self._art_qref = None
+        self._art_q0 = None
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
         if self.reverse_time:
             self._art_qref_np = self._art_qref_np[::-1].copy()
@@ -221,6 +222,7 @@ class RePHOArticulated(InterMimic):
             self._art_link_local_rot_np = self._art_link_local_rot_np[::-1].copy()
             self._art_intended_np = self._art_intended_np[::-1].copy()
         self._art_qref = torch.as_tensor(self._art_qref_np, device=self.device)
+        self._art_q0 = torch.as_tensor(self._art_q0_np, device=self.device)
         self._art_link_local = torch.as_tensor(
             self._art_link_local_np, device=self.device
         )
@@ -324,7 +326,9 @@ class RePHOArticulated(InterMimic):
 
     def _reset_target(self, env_ids):
         super()._reset_target(env_ids)
-        q0 = to_torch(self._art_q0_np, device=self.device)
+        q0 = self._art_q0
+        if q0 is None:
+            q0 = to_torch(self._art_q0_np, device=self.device)
         if self._art_qref is None:
             reset_qpos = q0.expand(env_ids.shape[0], -1)
         else:
