@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 from isaacgym import gymapi, gymtorch
 from isaacgym.torch_utils import to_torch
@@ -28,6 +29,24 @@ from pipeline.physics.mimic.repho_reference import (
 
 
 _ARTICULATED_OBJECT_COLLISION_FILTER = 2
+
+
+def _load_humanoid_tree(path):
+    root = ET.parse(path).getroot().find("worldbody/body")
+    if root is None:
+        raise ValueError(f"Humanoid MJCF has no worldbody root: {path}")
+    parents = []
+    offsets = []
+
+    def add(body, parent):
+        index = len(parents)
+        parents.append(parent)
+        offsets.append(np.fromstring(body.get("pos", "0 0 0"), sep=" "))
+        for child in body.findall("body"):
+            add(child, index)
+
+    add(root, -1)
+    return parents, np.asarray(offsets, dtype=np.float32)
 
 
 def _object_creation_pose(root_pos, root_rot, reverse_time):
@@ -172,6 +191,10 @@ class RePHOArticulated(InterMimic):
         self._art_humanoid_mjcf_path = Path(
             env["articulatedHumanoidXmlPath"]
         ).expanduser().resolve()
+        self._art_humanoid_parents, offsets = _load_humanoid_tree(
+            self._art_humanoid_mjcf_path
+        )
+        self._art_humanoid_offsets_np = offsets
         with np.load(Path(env["contactReferencePath"]).expanduser().resolve(), allow_pickle=False) as values:
             self._art_intended_np = np.asarray(values["contact_labels"], dtype=np.float32)
             self._art_contact_names = [
@@ -348,16 +371,50 @@ class RePHOArticulated(InterMimic):
         if self._art_rollout_path and len(env_ids) and torch.any(env_ids == 0):
             self._last_env0_reset_qpos = self._target_dof_pos[0].detach().cpu().numpy().copy()
 
-    def _reset_actors(self, env_ids):
-        super()._reset_actors(env_ids)
-        frames = self.progress_buf[env_ids].long()
-        reference = self.hoi_data[self.data_id[env_ids], frames]
-        body_pos = self.extract_data_component("body_pos", obs=reference)
-        body_rot = self.extract_data_component("body_rot", obs=reference)
-        pos_end = body_pos.shape[-1]
-        rot_end = pos_end + body_rot.shape[-1]
-        self._curr_state_complement[env_ids, 0, :pos_end] = body_pos
-        self._curr_state_complement[env_ids, 0, pos_end:rot_end] = body_rot
+    def _reset_envs(self, env_ids):
+        super()._reset_envs(env_ids)
+        if self.mode == "test" and self.save_states:
+            self._write_reset_body_cache(env_ids)
+
+    def _write_reset_body_cache(self, env_ids):
+        body_count = len(self._art_humanoid_parents)
+        if body_count != self.num_bodies or self.num_dof != 3 * (body_count - 1):
+            raise ValueError("RePHO humanoid tree and 153-DOF state disagree")
+        local_rot = torch.cat(
+            (
+                self._humanoid_root_states[env_ids, None, 3:7],
+                torch_utils.exp_map_to_quat(
+                    self._dof_pos[env_ids].reshape(len(env_ids), body_count - 1, 3)
+                ),
+            ),
+            dim=1,
+        )
+        offsets = torch.as_tensor(
+            self._art_humanoid_offsets_np,
+            device=self.device,
+            dtype=self._rigid_body_pos.dtype,
+        )
+        positions = [self._humanoid_root_states[env_ids, :3]]
+        rotations = [local_rot[:, 0]]
+        for body, parent in enumerate(self._art_humanoid_parents[1:], 1):
+            parent_rot = rotations[parent]
+            positions.append(
+                positions[parent]
+                + torch_utils.quat_rotate(
+                    parent_rot, offsets[body].expand(len(env_ids), -1)
+                )
+            )
+            rotations.append(
+                torch_utils.quat_mul(parent_rot, local_rot[:, body])
+            )
+        pos_end = 3 * body_count
+        rot_end = pos_end + 4 * body_count
+        self._curr_state_complement[env_ids, 0, :pos_end] = torch.stack(
+            positions, dim=1
+        ).flatten(1)
+        self._curr_state_complement[env_ids, 0, pos_end:rot_end] = torch.stack(
+            rotations, dim=1
+        ).flatten(1)
 
     def _reset_env_tensors(self, env_ids):
         human_ids = self._humanoid_actor_ids[env_ids]
