@@ -19,6 +19,20 @@ import json
 import xml.etree.ElementTree as ET
 
 
+def _atomic_savez(path, **values):
+    temporary = path + '.tmp'
+    with open(temporary, 'wb') as handle:
+        np.savez(handle, **values)
+    os.replace(temporary, path)
+
+
+def _atomic_torch_save(value, path):
+    temporary = path + '.tmp'
+    with open(temporary, 'wb') as handle:
+        torch.save(value, handle)
+    os.replace(temporary, path)
+
+
 
 class InterMimic(Humanoid_SMPLX):
     class StateInit(Enum):
@@ -37,6 +51,9 @@ class InterMimic(Humanoid_SMPLX):
         self.mode = cfg['env']['mode']
         state_init = cfg["env"]["stateInit"]
         self._state_init = InterMimic.StateInit[state_init]
+        self._schedule_start_epoch = int(
+            cfg['env'].get('scheduleStartEpoch', 53000)
+        )
         self._init_range_left = cfg["env"].get("init_range_left", None)
         self._init_range_right = cfg["env"].get("init_range_right", None)
         self.reverse_time = cfg["env"].get("reverse_time", False)
@@ -91,7 +108,6 @@ class InterMimic(Humanoid_SMPLX):
         self.dataset_index = self.dataset_index.to(self.device)
         self.hoi_data = self._load_motion(self.motion_file, topk=self.psi)
         self._curr_ref_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
-        self._hist_ref_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
         self._curr_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
         self._hist_obs = torch.zeros((self.num_envs, self.ref_hoi_obs_size), device=self.device, dtype=torch.float)
         self._tar_pos = torch.zeros([self.num_envs, 3], device=self.device, dtype=torch.float)
@@ -183,7 +199,7 @@ class InterMimic(Humanoid_SMPLX):
         return
 
     def _update_hist_hoi_obs(self, env_ids=None):
-        self._hist_obs = self._curr_obs.clone()
+        self._hist_obs, self._curr_obs = self._curr_obs, self._hist_obs
         return
         
     def _setup_character_props(self, key_bodies):
@@ -276,7 +292,7 @@ class InterMimic(Humanoid_SMPLX):
     
 
     def _load_motion(self, motion_file, startk=0, topk=1, initk=0):
-        self.curr_epoch = 53001
+        self.curr_epoch = self._schedule_start_epoch + 1
         hoi_datas = []
         hoi_refs = []
         if type(motion_file) != type([]):
@@ -895,14 +911,18 @@ class InterMimic(Humanoid_SMPLX):
 
     def save_curr_epoch(self, epoch):
         self.curr_epoch = epoch
-        
+
+    def _stage_epoch(self, epoch=None):
+        logical_epoch = self.curr_epoch if epoch is None else epoch
+        return logical_epoch - self._schedule_start_epoch + 53000
         
     def save_ref_reward(self, epoch):
         self.curr_epoch = epoch
-        if epoch >56000:
+        stage_epoch = self._stage_epoch(epoch)
+        if stage_epoch >56000:
             print('run too long, quit')
             quit()
-        if self.curr_epoch < 53200 or self.curr_epoch % 100 == 0:
+        if stage_epoch < 53200 or stage_epoch % 100 == 0:
             to_draw = True
         else:
             to_draw = False
@@ -916,9 +936,9 @@ class InterMimic(Humanoid_SMPLX):
         file_path_for_hoi_opposite = os.path.join(self.cam_img_dir, 'ref_hoi',f'opposite_ref_hoi_{epoch}.npz')
         indices_for_velocity = list(range(7, 13)) + list(range(166, 319)) + list(range(326, 332))
         if self.reverse_time:
-            np.savez(file_path, ref_reward=self.ref_reward.flip(2).cpu().numpy())
+            _atomic_savez(file_path, ref_reward=self.ref_reward.flip(2).cpu().numpy())
 
-            np.savez(file_path_for_opposite, ref_reward=self.ref_reward_for_opposite.flip(2).cpu().numpy())
+            _atomic_savez(file_path_for_opposite, ref_reward=self.ref_reward_for_opposite.flip(2).cpu().numpy())
 
 
             hoi_refs_for_opposite_for_save = torch.cat([self.hoi_refs_for_opposite.clone(),self.contact_refs_for_opposite.clone()], dim=-1)
@@ -927,27 +947,28 @@ class InterMimic(Humanoid_SMPLX):
             
             hoi_refs_for_save = torch.cat([self.hoi_refs.clone(),self.contact_refs.clone()], dim=-1)
             hoi_refs_for_save[:, :, :, indices_for_velocity] *= -1
-            np.savez(file_path_for_hoi_opposite, hoi_refs=hoi_refs_for_opposite_for_save.flip(2).cpu().numpy())
-            np.savez(file_path_for_hoi, hoi_refs=hoi_refs_for_save.flip(2).cpu().numpy())
-            np.savez(file_path_for_contact, contact_refs=self.contact_refs.flip(2).cpu().numpy()[:,:,140:170])
+            _atomic_savez(file_path_for_hoi_opposite, hoi_refs=hoi_refs_for_opposite_for_save.flip(2).cpu().numpy())
+            _atomic_savez(file_path_for_hoi, hoi_refs=hoi_refs_for_save.flip(2).cpu().numpy())
+            _atomic_savez(file_path_for_contact, contact_refs=self.contact_refs.flip(2).cpu().numpy()[:,:,140:170])
         else:
-            np.savez(file_path, ref_reward=self.ref_reward.cpu().numpy())
+            _atomic_savez(file_path, ref_reward=self.ref_reward.cpu().numpy())
 
-            np.savez(file_path_for_opposite, ref_reward=self.ref_reward_for_opposite.cpu().numpy())
+            _atomic_savez(file_path_for_opposite, ref_reward=self.ref_reward_for_opposite.cpu().numpy())
 
 
-            np.savez(file_path_for_hoi_opposite, hoi_refs=self.hoi_refs_for_opposite.cpu().numpy())
-            np.savez(file_path_for_hoi_opposite, hoi_refs=torch.cat([self.hoi_refs_for_opposite.clone(),self.contact_refs_for_opposite.clone()], dim=-1).cpu().numpy())
-            np.savez(file_path_for_hoi, hoi_refs=self.hoi_refs.cpu().numpy())
-            np.savez(file_path_for_hoi, hoi_refs=torch.cat([self.hoi_refs.clone(),self.contact_refs.clone()], dim=-1).cpu().numpy())
-            np.savez(file_path_for_contact, contact_refs=self.contact_refs.cpu().numpy()[:,:,140:170])
+            _atomic_savez(file_path_for_hoi_opposite, hoi_refs=torch.cat([self.hoi_refs_for_opposite,self.contact_refs_for_opposite], dim=-1).cpu().numpy())
+            _atomic_savez(file_path_for_hoi, hoi_refs=torch.cat([self.hoi_refs,self.contact_refs], dim=-1).cpu().numpy())
+            _atomic_savez(file_path_for_contact, contact_refs=self.contact_refs.cpu().numpy()[:,:,140:170])
         if epoch % 100 == 0:
             os.makedirs(self.cam_img_dir+'/hoi_data', exist_ok=True)
 
-            torch.save(self.hoi_data[0].cpu(), os.path.join(self.cam_img_dir, 'hoi_data',f'intermimic_{epoch}.pt'))
+            _atomic_torch_save(self.hoi_data[0].cpu(), os.path.join(self.cam_img_dir, 'hoi_data',f'intermimic_{epoch}.pt'))
         if epoch % 100 == 0:
             self.save_run_val()
-            if (epoch - self._finish_epoch >= 1000) and epoch >= 55000:
+            if (
+                stage_epoch - self._finish_epoch >= 1000
+                and stage_epoch >= 55000
+            ):
                 print('finish epoch reached, quit')
                 quit()
 
@@ -971,17 +992,12 @@ class InterMimic(Humanoid_SMPLX):
             forward_data = os.path.join(self.cam_img_dir, 'ref_tar', f'ref_tar_{self.curr_epoch}','intermimic.pt').replace('backward','forward')
             while not os.path.exists(forward_data):
                 time.sleep(2)
-            time.sleep(10)
             command = f'bash scripts/train_dual_backward_val.sh {val_config["seq_name"]} {validation_gpu_id} {val_config["out_root"]} {val_config["motion_root"]} {val_config["cfg_env"]} {val_config["cfg_train"]} {self.curr_epoch} {init_range_left_val} {task} {sub_file_name}'
         return_code = os.system(command)
         if return_code != 0:
             raise RuntimeError(f'RePHO validation failed with status {return_code}: {command}')
         
         print(f'run val with command: {command}')
-
-        path_to_save_command = os.path.join(self.cam_img_dir, 'ref_tar', f'command_{self.curr_epoch}.txt')
-
-        os.makedirs(os.path.dirname(path_to_save_command), exist_ok=True)
 
 
 
@@ -1032,7 +1048,8 @@ class InterMimic(Humanoid_SMPLX):
 
 
     def load_ref_reward(self, epoch):
-        if epoch >56000:
+        stage_epoch = self._stage_epoch(epoch)
+        if stage_epoch >56000:
             quit()
         if not self.dual_update:
             return
@@ -1046,7 +1063,6 @@ class InterMimic(Humanoid_SMPLX):
                 print(f'Waiting for {file_path} and {file_path_for_hoi} to be available...')
                 time.sleep(2)  # Wait for 2 seconds before checking again
 
-            time.sleep(5.5)
             loaded_dict = np.load(file_path, allow_pickle=True)
             ref_reward_from_opposite = torch.from_numpy(loaded_dict['ref_reward']).flip(2).to(self.device)
             loaded_dict = np.load(file_path_for_hoi, allow_pickle=True)
@@ -1060,7 +1076,6 @@ class InterMimic(Humanoid_SMPLX):
             while not (os.path.exists(file_path) and os.path.exists(file_path_for_hoi)):
                 print(f'Waiting for {file_path} and {file_path_for_hoi} to be available...')
                 time.sleep(2)  # Wait for 2 seconds before checking again
-            time.sleep(5.5)
             loaded_dict = np.load(file_path, allow_pickle=True)
             ref_reward_from_opposite = torch.from_numpy(loaded_dict['ref_reward']).to(self.device)
             loaded_dict = np.load(file_path_for_hoi, allow_pickle=True)
@@ -1075,7 +1090,7 @@ class InterMimic(Humanoid_SMPLX):
 
         self.hoi_refs[:,index_current,:] = torch.where(mask.unsqueeze(-1).expand(-1,-1,self.hoi_refs.shape[-1]), hoi_refs_from_opposite[:,index_opposite,:,:self.hoi_refs.shape[-1]], self.hoi_refs[:,index_current,:])
         self.contact_refs[:,index_current,:] = torch.where(mask.unsqueeze(-1).expand(-1,-1,self.contact_refs.shape[-1]), hoi_refs_from_opposite[:,index_opposite,:,self.hoi_refs.shape[-1]:], self.contact_refs[:,index_current,:])
-        if epoch % 100 == 0 and epoch>=54300:
+        if epoch % 100 == 0 and stage_epoch>=54300:
             self.load_ref_traj()
         if epoch % 100 == 0:
             self.load_run_val()
@@ -1100,6 +1115,7 @@ class InterMimic(Humanoid_SMPLX):
         return starts[idx].item(), ends[idx].item() - 1, (ends[idx] - starts[idx]).item()
 
     def load_run_val(self):
+        stage_epoch = self._stage_epoch()
         self_path = os.path.join(self.cam_img_dir, 'ref_tar', f'ref_tar_{self.curr_epoch}/intermimic.pt')
         if not self.reverse_time:
             opposite_path = self_path.replace('forward','backward')
@@ -1112,11 +1128,11 @@ class InterMimic(Humanoid_SMPLX):
             self_hoi_data_candidate = torch.load(self_path, map_location=self.device).flip(0)
         self_indices = torch.where(self_hoi_data_candidate[:, -1] > 0.5)[0]
         if (self_indices.numel() >= self.max_episode_length[0]-1) and (self._finish_epoch>58500) and not self.reverse_time:
-            self._finish_epoch = self.curr_epoch
+            self._finish_epoch = stage_epoch
                 
         if self_indices.numel() > 0:
             self_indices = self_indices[:0] if torch.sum(self.contact_obj_whole[self_indices].clamp(0,1))/self_indices.numel() < 0.5 else self_indices
-        if self_indices.numel() > 0 and self.curr_epoch >= 54400:
+        if self_indices.numel() > 0 and stage_epoch >= 54400:
             left = self_indices[0].item()
             right = self_indices[-1].item()
             value_candidate = torch.zeros(self.max_episode_length, device=self.device)
@@ -1126,14 +1142,6 @@ class InterMimic(Humanoid_SMPLX):
             mask = (value_candidate > value_current+30) & (value_candidate > value_current*3/2) & (value_candidate>60)
             mask_left, mask_right, mask_length = self.get_longest_true_segment(mask)
 
-            
-            path_to_save_command = os.path.join(self.cam_img_dir, 'ref_tar', f'info_self_{self.curr_epoch}.json')
-            os.makedirs(os.path.dirname(path_to_save_command), exist_ok=True)
-            to_save = {'left':left,'right':right,'mask_left': mask_left, 'mask_right': mask_right, 'mask_length': mask_length, 'value_candidate': value_candidate.detach().cpu().numpy().tolist(), 'value_current': value_current.detach().cpu().numpy().tolist(),'mask': mask.detach().cpu().numpy().tolist()}
-
-
-
-                
             if mask_length > 30:
                 mask=torch.zeros(self.max_episode_length ,dtype=torch.bool, device=self.device)
                 mask[mask_left:mask_right+1] = True
@@ -1145,7 +1153,6 @@ class InterMimic(Humanoid_SMPLX):
         while not os.path.exists(opposite_path):
             print(f'Waiting for {opposite_path} to be available...')
             time.sleep(2)  # Wait for 2 seconds before checking again
-        time.sleep(10)
         if not self.reverse_time:
             opposite_hoi_data_candidate = torch.load(opposite_path, map_location=self.device)
         else:
@@ -1153,11 +1160,11 @@ class InterMimic(Humanoid_SMPLX):
 
         opposite_indices = torch.where(opposite_hoi_data_candidate[:, -1] > 0.5)[0]
         if (opposite_indices.numel() >= self.max_episode_length[0]-1) and (self._finish_epoch>58500) and self.reverse_time:
-            self._finish_epoch = self.curr_epoch
+            self._finish_epoch = stage_epoch
             
         if opposite_indices.numel() > 0:
             opposite_indices = opposite_indices[:0] if torch.sum(self.contact_obj_whole[opposite_indices].clamp(0,1))/opposite_indices.numel() < 0.5 else opposite_indices
-        if opposite_indices.numel() > 0 and self.curr_epoch >= 54400:
+        if opposite_indices.numel() > 0 and stage_epoch >= 54400:
             left = opposite_indices[0].item()
             right = opposite_indices[-1].item()
             value_candidate = torch.zeros((self.max_episode_length,),device=self.device)
@@ -1167,14 +1174,6 @@ class InterMimic(Humanoid_SMPLX):
             mask = (value_candidate > value_current+60) & (value_candidate > value_current*3/2) & (value_candidate>90)
             mask_left, mask_right, mask_length = self.get_longest_true_segment(mask)
             # print('oppo','mask_left, mask_right,mask_length',mask_left, mask_right,mask_length)
-            
-            path_to_save_command = os.path.join(self.cam_img_dir, 'ref_tar', f'info_oppo_{self.curr_epoch}.json')
-            os.makedirs(os.path.dirname(path_to_save_command), exist_ok=True)
-            to_save = {'left':left,'right':right,'mask_left': mask_left, 'mask_right': mask_right, 'mask_length': mask_length, 'value_candidate': value_candidate.detach().cpu().numpy().tolist(), 'value_current': value_current.detach().cpu().numpy().tolist(),'mask': mask.detach().cpu().numpy().tolist()}
-
-
-                
-                
             if mask_length > 30 or (mask_length>=5 and mask_left<=5):
                 mask=torch.zeros(self.max_episode_length ,dtype=torch.bool, device=self.device)
                 mask[mask_left:min(mask_right+11,self.max_episode_length)] = True
@@ -1683,7 +1682,7 @@ class InterMimic(Humanoid_SMPLX):
     
     def _compute_observations_iter(self, hoi_data, env_ids=None, delta_t=1):
         if (env_ids is None):
-            env_ids = to_torch(np.arange(self.num_envs), device=self.device, dtype=torch.long)
+            env_ids = self._all_env_ids
 
         ts = self.progress_buf[env_ids].clone() 
 
@@ -1800,16 +1799,20 @@ class InterMimic(Humanoid_SMPLX):
 
             # Get trajectory information for resetting environments
             start_index, end_index = self.start_times[reset_ind], self.progress_buf[reset_ind]
-            self.to_end_cnt+=((end_index>=max_episode_length[0]-1) & (start_index<max_episode_length[0]-50)).sum().item()
-            self.middle_to_end_cnt+= ((end_index>=max_episode_length[0]-1) & (start_index<max_episode_length[0]//2)).sum().item()
-            self.left_to_end_cnt+= ((end_index>=max_episode_length[0]-1) & (start_index<=self._init_range_left+0)).sum().item()
+            counter_updates = torch.stack((
+                ((end_index>=max_episode_length[0]-1) & (start_index<max_episode_length[0]-50)).sum(),
+                ((end_index>=max_episode_length[0]-1) & (start_index<max_episode_length[0]//2)).sum(),
+                ((end_index>=max_episode_length[0]-1) & (start_index<=self._init_range_left+0)).sum(),
+            )).cpu().tolist()
+            self.to_end_cnt += counter_updates[0]
+            self.middle_to_end_cnt += counter_updates[1]
+            self.left_to_end_cnt += counter_updates[2]
             # print(self.to_end_cnt, self.middle_to_end_cnt,'middle_to_end_cnt',self.left_to_end_cnt)
             
             if self.left_to_end_cnt>200:
                 self._init_range_left = 0
             
 
-            curr_sum_reward = self._sum_reward[reset_ind] #.sum()  # Average reward (currently unused)
             curr_reward = self._curr_reward[reset_ind]  # Reward history for these episodes
 
             # Early exit condition (currently disabled: torch.rand(1)[0] < 0 is always False)
@@ -1824,90 +1827,170 @@ class InterMimic(Humanoid_SMPLX):
             self._curr_reward[reset_ind] = 0
             # reset_ind = torch.logical_and(reset_ind, self.max_episode_length[self.data_id] > self.rollout_length)
 
-            # Skip if too few environments meet the criteria (less than 99.5% threshold)
-            # This ensures we have enough data for meaningful database updates
-            if reset_ind.sum() < 0.995:
-                return
-
-            # Extract trajectory data from successful episodes
-            
             state = self._curr_state[reset_ind]         # State history for these episodes
-            state_complement = self._curr_state_complement[reset_ind]  # Complementary state history
-
             reward = torch.zeros((curr_reward.shape[0], self.hoi_refs.shape[0], self.hoi_refs.shape[2]), device=curr_reward.device)
             reward_opposite = torch.zeros((curr_reward.shape[0], self.hoi_refs.shape[0], self.hoi_refs.shape[2]), device=curr_reward.device)
-            sum_reward = torch.zeros((curr_reward.shape[0], self.hoi_refs.shape[0], self.hoi_refs.shape[2]), device=curr_reward.device)
-            
-            for i in range(curr_reward.shape[0]):
-                # Only process trajectories with sufficient length (30+ steps)
-                # if end_index[i] > start_index[i] + 25:
-                contact_obj = self.extract_data_component('contact_obj', obs=self.hoi_data[0, start_index[i]:end_index[i]])
-                contact_obj_whole = self.extract_data_component('contact_obj', obs=self.hoi_data[0, 0:self.max_episode_length[0]])
-                contact_obj_expand = self.extract_data_component('contact_obj', obs=self.hoi_data[0, max(0,start_index[i]-20):min(self.max_episode_length[0]-2,end_index[i]+20)])
-
-
-                long_enough_1 = (end_index[i] - start_index[i] > 30) and ((torch.all(contact_obj_expand>0.1)) or (torch.all(contact_obj_whole<0.1)))
-                long_enough_2 = (end_index[i] - start_index[i] > 70) and ((torch.sum(contact_obj)>70) or (torch.all(contact_obj_whole<0.1)))
-
-
-                if long_enough_1 or long_enough_2:
-                    if self.to_end_cnt>50 and end_index[i]>=max_episode_length[0]-1:
-                        index_tensor = torch.arange(0, end_index[i]-start_index[i]+1, device=start_index.device).flip(0)
-                        reward[i, data_id[i], start_index[i]:end_index[i]+1] = index_tensor
-                        if end_index[i]-start_index[i] > 60:
-                            reward_opposite[i, data_id[i], start_index[i]:end_index[i]+1] = index_tensor.flip(0)
-                    else:
-                        index_tensor = torch.arange(20, end_index[i]-start_index[i]+1, device=start_index.device).flip(0)
-                        reward[i, data_id[i], start_index[i]:end_index[i]-20+1] = index_tensor
-                        if end_index[i]-start_index[i] > 60:
-                            reward_opposite[i, data_id[i], start_index[i]:end_index[i]-20+1] = index_tensor.flip(0)-10
-
-                elif torch.all(contact_obj_expand>0.1):
-                    reward[i, data_id[i], start_index[i]] = end_index[i] - start_index[i]
+            frames = torch.arange(reward.shape[2], device=reward.device)
+            frame_grid = frames.unsqueeze(0)
+            duration = end_index - start_index
+            contact = self.extract_data_component(
+                'contact_obj', obs=self.hoi_data[0]
+            ).reshape(-1)
+            contact_frames = torch.arange(contact.shape[0], device=contact.device)
+            contact_grid = contact_frames.unsqueeze(0)
+            contact_interval = (
+                (contact_grid >= start_index.unsqueeze(1))
+                & (contact_grid < end_index.unsqueeze(1))
+            )
+            contact_sum = torch.where(
+                contact_interval,
+                contact.unsqueeze(0),
+                torch.zeros((), device=contact.device, dtype=contact.dtype),
+            ).sum(dim=1)
+            expand_left = (start_index - 20).clamp_min(0)
+            expand_right = torch.minimum(
+                end_index + 20,
+                max_episode_length[0] - 2,
+            )
+            expand_interval = (
+                (contact_grid >= expand_left.unsqueeze(1))
+                & (contact_grid < expand_right.unsqueeze(1))
+            )
+            expand_all_contact = ~torch.any(
+                expand_interval & ~(contact.unsqueeze(0) > 0.1),
+                dim=1,
+            )
+            whole_interval = contact_frames < max_episode_length[0]
+            whole_no_contact = ~torch.any(
+                whole_interval & ~(contact < 0.1)
+            )
+            long_enough = (
+                ((duration > 30) & (expand_all_contact | whole_no_contact))
+                | ((duration > 70) & ((contact_sum > 70) | whole_no_contact))
+            )
+            full_segment = (
+                long_enough
+                & (self.to_end_cnt > 50)
+                & (end_index >= max_episode_length[0] - 1)
+            )
+            full_frames = (
+                full_segment.unsqueeze(1)
+                & (frame_grid >= start_index.unsqueeze(1))
+                & (frame_grid <= end_index.unsqueeze(1))
+            )
+            truncated_frames = (
+                (long_enough & ~full_segment).unsqueeze(1)
+                & (frame_grid >= start_index.unsqueeze(1))
+                & (frame_grid <= (end_index - 20).unsqueeze(1))
+            )
+            fallback_frames = (
+                (~long_enough & expand_all_contact).unsqueeze(1)
+                & (frame_grid == start_index.unsqueeze(1))
+            )
+            reset_row, frame = torch.where(
+                full_frames | truncated_frames | fallback_frames
+            )
+            reward[reset_row, data_id[reset_row], frame] = (
+                end_index[reset_row] - frame
+            ).to(reward.dtype)
+            opposite_full = full_frames & (duration > 60).unsqueeze(1)
+            opposite_truncated = (
+                truncated_frames & (duration > 60).unsqueeze(1)
+            )
+            reset_row, frame = torch.where(opposite_full)
+            reward_opposite[reset_row, data_id[reset_row], frame] = (
+                frame - start_index[reset_row]
+            ).to(reward_opposite.dtype)
+            reset_row, frame = torch.where(opposite_truncated)
+            reward_opposite[reset_row, data_id[reset_row], frame] = (
+                frame - start_index[reset_row] + 10
+            ).to(reward_opposite.dtype)
 
             adjust_reward, adjust_reward_index = reward.max(dim=0)
             adjust_reward_opposite, adjust_reward_index_opposite = reward_opposite.max(dim=0)
-            # print(adjust_reward,adjust_reward_index)
+            value, slot = self.ref_reward[:, 1:, :].min(dim=1)
+            slot = slot + 1
+            motion_grid = torch.arange(
+                reward.shape[1], device=reward.device
+            ).unsqueeze(1).expand(-1, reward.shape[2])
+            frame_grid = frames.unsqueeze(0).expand(reward.shape[1], -1)
+            winner = adjust_reward_index
+            source_frame = frame_grid - start_index[winner]
+            requested_length = end_index[winner] - frame_grid + 1
+            reward_frames = curr_reward.shape[1]
+            effective_length = torch.where(
+                requested_length >= 0,
+                requested_length.clamp_max(reward_frames),
+                (reward_frames + requested_length).clamp_min(0),
+            )
+            discounted = curr_reward * self.powers[:reward_frames]
+            discounted_sums = torch.stack(
+                [
+                    discounted[:, :length].sum(dim=1)
+                    for length in range(1, reward_frames + 1)
+                ],
+                dim=1,
+            )
+            sum_reward_to_compare = discounted_sums[
+                winner,
+                (effective_length - 1).clamp_min(0),
+            ]
+            sum_reward_to_compare = torch.where(
+                effective_length > 0,
+                sum_reward_to_compare,
+                torch.zeros_like(sum_reward_to_compare),
+            )
+            current_sum = self.ref_reward_sum[motion_grid, slot, frame_grid]
+            ratio = max((53250-self._stage_epoch())/1000,0)
+            update = (
+                (source_frame >= 0)
+                & (
+                    (
+                        (adjust_reward > value)
+                        & (sum_reward_to_compare >= current_sum * ratio)
+                    )
+                    | (adjust_reward > value + 10)
+                )
+            )
+            motion, frame = torch.where(update)
+            target_slot = slot[motion, frame]
+            source = winner[motion, frame]
+            source_time = source_frame[motion, frame]
+            self.ref_reward[motion, target_slot, frame] = adjust_reward[motion, frame]
+            self.ref_reward_sum[motion, target_slot, frame] = sum_reward_to_compare[motion, frame]
+            self.hoi_refs[motion, target_slot, frame] = state[source, source_time]
+            update_contact = update & (source_frame > 0)
+            motion, frame = torch.where(update_contact)
+            target_slot = slot[motion, frame]
+            source = winner[motion, frame]
+            source_time = source_frame[motion, frame]
+            current_contact = self._curr_contact[reset_ind]
+            self.contact_refs[motion, target_slot, frame] = current_contact[
+                source, source_time
+            ]
 
-            for i in range(reward.shape[1]):  # For each motion sequence
-                for j in range(reward.shape[2]):  # For each time step
-                    # Find the slot with minimum reward in the reference database (excluding slot 0)
-                    # This is where we'll potentially insert the new successful trajectory
-                    
-                    value, index = self.ref_reward[i, 1:, j].min(dim=0)
-                    index = index + 1  # Adjust for excluding slot 0
-
-                    # Get the trajectory that achieved the best reward at this (motion, time)
-                    id1 = adjust_reward_index[i, j]  # Which trajectory achieved best reward
-                    idx = j - start_index[adjust_reward_index[i, j]]  # Relative time within that trajectory
-
-                    if idx>=0:
-                        sum_reward_to_be_compare = (curr_reward[id1, :end_index[adjust_reward_index[i, j]]-j+1] * self.powers[:end_index[adjust_reward_index[i, j]]-j+1]).sum()
-                    else:
-                        sum_reward_to_be_compare = 0
-
-                    ratio = max((53250-self.curr_epoch)/1000,0)
-                        
-                    if idx >= 0 and ((adjust_reward[i, j] > value and sum_reward_to_be_compare >= self.ref_reward_sum[i, index, j]*ratio) or adjust_reward[i, j] > value + 10):
-                        
-                        # Replace the worst reference with this successful trajectory segment
-                        self.ref_reward[i, index, j] = adjust_reward[i, j]  # Update reward
-                        # import pdb; pdb.set_trace()
-                        self.ref_reward_sum[i, index, j] = sum_reward_to_be_compare
-                        # if idx > 0:
-                        self.hoi_refs[i, index, j] = state[id1, idx]        # Update state reference
-                        if idx > 0:
-                            self.contact_refs[i, index, j] = self._curr_contact[reset_ind][id1, idx]
-
-                    value_opposite, index_opposite = self.ref_reward_for_opposite[i, 1:, j].min(dim=0)
-                    index_opposite = index_opposite + 1  # Adjust for excluding slot 0
-                    id1_opposite = adjust_reward_index_opposite[i, j]  # Which trajectory achieved best reward
-                    idx_opposite = j - start_index[adjust_reward_index_opposite[i, j]]  # Relative time within that trajectory
-                    if idx_opposite >= 0 and adjust_reward_opposite[i, j] > value_opposite:
-                        # Replace the worst reference with this successful trajectory segment
-                        self.ref_reward_for_opposite[i, index_opposite, j] = adjust_reward_opposite[i, j]  # Update reward
-                        # if idx_opposite > 0:
-                        self.hoi_refs_for_opposite[i, index_opposite, j] = state[id1_opposite, idx_opposite]        # Update state reference
+            value_opposite, slot_opposite = self.ref_reward_for_opposite[
+                :, 1:, :
+            ].min(dim=1)
+            slot_opposite = slot_opposite + 1
+            winner_opposite = adjust_reward_index_opposite
+            source_frame_opposite = (
+                frame_grid - start_index[winner_opposite]
+            )
+            update_opposite = (
+                (source_frame_opposite >= 0)
+                & (adjust_reward_opposite > value_opposite)
+            )
+            motion, frame = torch.where(update_opposite)
+            target_slot = slot_opposite[motion, frame]
+            source = winner_opposite[motion, frame]
+            source_time = source_frame_opposite[motion, frame]
+            self.ref_reward_for_opposite[
+                motion, target_slot, frame
+            ] = adjust_reward_opposite[motion, frame]
+            self.hoi_refs_for_opposite[
+                motion, target_slot, frame
+            ] = state[source, source_time]
 
                         
         # self.ref_reward[:, 1:, :] = self.ref_reward[:, 1:, :] * (1 - 5e-4)
@@ -1920,11 +2003,10 @@ class InterMimic(Humanoid_SMPLX):
             self.ref_reward_for_opposite[:, 1:, :] = self.ref_reward_for_opposite[:, 1:, :] * (1 - 5e-8)
             self.ref_reward_sum = self.ref_reward_sum * (1-5e-2)
 
-        if True:
-            if torch.sum(self.ref_reward>25)>3 and self.curr_epoch>30:
-                # print('ref_reward>25', torch.sum(self.ref_reward>25))
-                self._state_init = InterMimic.StateInit.Hybrid
-            if self.curr_epoch>150 and torch.sum(self.ref_reward>12)>3:
+        if self._state_init != InterMimic.StateInit.Hybrid:
+            stage_epoch = self._stage_epoch()
+            threshold = 12 if stage_epoch > 150 else 25
+            if stage_epoch > 30 and torch.count_nonzero(self.ref_reward > threshold) > 3:
                 self._state_init = InterMimic.StateInit.Hybrid
         return
     
@@ -1960,6 +2042,12 @@ class InterMimic(Humanoid_SMPLX):
         rig, ig_reset = self.compute_ig_reward(self.reward_weights, key_pos, ref_key_pos, obj_points, ref_obj_points)
         rcg, contact_reset = self.compute_cg_reward(self.reward_weights)
         self.rew_buf[:] = rb * ro * rig * rcg * rcc
+        if self._termination_grace_steps is not None:
+            past_grace = (
+                self.progress_buf
+                > self._termination_grace_steps + self.start_times
+            )
+            contact_reset *= past_grace.unsqueeze(-1)
         kinematic_reset = torch.logical_or(human_reset, object_reset)
         if self.mode == 'train':
             self.contact_reset = (self.contact_reset + contact_reset) * contact_reset
@@ -2038,7 +2126,7 @@ class InterMimic(Humanoid_SMPLX):
             if self.reverse_time:
                 new_hoi_data = new_hoi_data.flip(0)
             os.makedirs(self.cam_img_dir, exist_ok=True)
-            torch.save(new_hoi_data, os.path.join(self.cam_img_dir, 'intermimic.pt'))
+            _atomic_torch_save(new_hoi_data, os.path.join(self.cam_img_dir, 'intermimic.pt'))
             quit()
         if self.mode == 'test' and torch.any(self.progress_buf[0] >= right-1):
             quit()
@@ -2262,7 +2350,6 @@ class InterMimic(Humanoid_SMPLX):
         return ro, object_reset, obj_points, ref_obj_points
     
     def compute_contact_chamfer_reward(self, w, all_pos, ref_all_pos, obj_points, ref_obj_points):
-        env_ids = torch.arange(self.num_envs, device=self.device)
         self.left_hand_ids = list(range(17, 33))
         self.right_hand_ids = list(range(36, 52))
 
@@ -2281,16 +2368,17 @@ class InterMimic(Humanoid_SMPLX):
         contact_valid_bit = contact_refs[0,highest_ref_index,self.progress_buf,0,0]>0.5
 
         cdist_left_new = torch.zeros(self.num_envs, 16, device=self.device)
-        #get the minimum 3 distances on dim -1 of cdist_left
-        self._curr_contact[env_ids,self.progress_buf-self.start_times,3:]= torch.cat([cdist_left.sort(dim=-1)[1][:,:,:3],cdist_right.sort(dim=-1)[1][:,:,:3]],dim=1).view(self.num_envs,-1).float()
+        sorted_left, sorted_left_index = cdist_left.sort(dim=-1)
+        sorted_right, sorted_right_index = cdist_right.sort(dim=-1)
+        self._curr_contact[self._all_env_ids,self.progress_buf-self.start_times,3:]= torch.cat([sorted_left_index[:,:,:3],sorted_right_index[:,:,:3]],dim=1).view(self.num_envs,-1).float()
 
         
-        cdist_left_new[~contact_valid_bit] = cdist_left[~contact_valid_bit].min(dim=-1)[0]
+        cdist_left_new[~contact_valid_bit] = sorted_left[~contact_valid_bit, :, 0]
         index_on_obj = contact_refs[0,highest_ref_index,self.progress_buf,1:17,:][contact_valid_bit].long() #排除第一位valid位
         cdist_left_new[contact_valid_bit] = torch.gather(cdist_left[contact_valid_bit], dim=-1, index=index_on_obj).mean(dim=-1)
 
         cdist_right_new = torch.zeros(self.num_envs, 16, device=self.device)
-        cdist_right_new[~contact_valid_bit] = cdist_right[~contact_valid_bit].min(dim=-1)[0]
+        cdist_right_new[~contact_valid_bit] = sorted_right[~contact_valid_bit, :, 0]
         index_on_obj = contact_refs[0,highest_ref_index,self.progress_buf,17:,:][contact_valid_bit].long()
 
         cdist_right_new[contact_valid_bit] = torch.gather(cdist_right[contact_valid_bit], dim=-1, index=index_on_obj).mean(dim=-1)
@@ -2585,9 +2673,8 @@ def compute_sdf(points1, points2):
     # Find indices of minimum distances for each point in points1
     min_length_indices = torch.argmin(dis_mat_lengths, dim=-1)  # [batch, num_points1]
     
-    # Create indices for batch and point dimensions
-    B_indices, N_indices = torch.meshgrid(torch.arange(points1.shape[0]), torch.arange(points1.shape[1]), indexing='ij')
-    
-    # Get vectors to nearest points
-    min_dis_mat = dis_mat[B_indices, N_indices, min_length_indices].contiguous()
+    gather_index = min_length_indices.unsqueeze(-1).unsqueeze(-1).expand(
+        -1, -1, 1, dis_mat.shape[-1]
+    )
+    min_dis_mat = dis_mat.gather(2, gather_index).squeeze(2).contiguous()
     return min_dis_mat

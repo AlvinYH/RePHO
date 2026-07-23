@@ -220,6 +220,7 @@ class RePHOArticulated(InterMimic):
         self._art_rollout_written = False
         self._art_rollout_terminated = None
         self._last_env0_reset_qpos = None
+        self._art_qref = None
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
         if self.reverse_time:
             self._art_qref_np = self._art_qref_np[::-1].copy()
@@ -330,11 +331,23 @@ class RePHOArticulated(InterMimic):
 
     def _reset_target(self, env_ids):
         super()._reset_target(env_ids)
-        self._target_dof_pos[env_ids] = to_torch(self._art_q0_np, device=self.device)
+        q0 = to_torch(self._art_q0_np, device=self.device)
+        if self._art_qref is None:
+            reset_qpos = q0.expand(env_ids.shape[0], -1)
+        else:
+            frames = torch.clamp(
+                self.progress_buf[env_ids].long(),
+                0,
+                self._art_qref.shape[0] - 1,
+            )
+            reset_qpos = self._art_qref[frames].clone()
+            if not self.reverse_time:
+                reset_qpos[frames == 0] = q0
+        self._target_dof_pos[env_ids] = reset_qpos
         self._target_dof_vel[env_ids] = 0.0
         if self._art_rollout_terminated is not None:
             self._art_rollout_terminated[env_ids] = False
-        if torch.any(env_ids == 0):
+        if self._art_rollout_path and torch.any(env_ids == 0):
             self._last_env0_reset_qpos = self._target_dof_pos[0].detach().cpu().numpy().copy()
 
     def _reset_env_tensors(self, env_ids):

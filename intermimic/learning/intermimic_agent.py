@@ -363,7 +363,13 @@ class InterMimicAgent(common_agent.CommonAgent):
             for i in range(len(self.dataset)):
                 curr_train_info = self.train_actor_critic(self.dataset[i]) # updating
                 
-                if self.schedule_type == 'legacy':  
+                if (
+                    self.schedule_type == 'legacy'
+                    and (
+                        self.multi_gpu
+                        or self.scheduler.__class__.__name__ != 'IdentityScheduler'
+                    )
+                ):
                     if self.multi_gpu:
                         curr_train_info['kl'] = self.hvd.average_value(curr_train_info['kl'], 'ep_kls')
                     self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, curr_train_info['kl'].item())
@@ -379,13 +385,25 @@ class InterMimicAgent(common_agent.CommonAgent):
             
             av_kls = torch_ext.mean_list(train_info['kl'])
 
-            if self.schedule_type == 'standard':
+            if (
+                self.schedule_type == 'standard'
+                and (
+                    self.multi_gpu
+                    or self.scheduler.__class__.__name__ != 'IdentityScheduler'
+                )
+            ):
                 if self.multi_gpu:
                     av_kls = self.hvd.average_value(av_kls, 'ep_kls')
                 self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
                 self.update_lr(self.last_lr)
 
-        if self.schedule_type == 'standard_epoch':
+        if (
+            self.schedule_type == 'standard_epoch'
+            and (
+                self.multi_gpu
+                or self.scheduler.__class__.__name__ != 'IdentityScheduler'
+            )
+        ):
             if self.multi_gpu:
                 av_kls = self.hvd.average_value(torch_ext.mean_list(kls), 'ep_kls')
             self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
@@ -560,20 +578,22 @@ class InterMimicAgent(common_agent.CommonAgent):
         return
     
     def get_cpu_usage(self):
-        return psutil.cpu_percent(interval=1)
+        return psutil.cpu_percent(interval=None)
 
     def get_cpu_memory_usage(self):
         return psutil.virtual_memory().percent
     
-    # Function to get GPU usage
     def get_gpu_usage(self):
-        result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader'], stdout=subprocess.PIPE)
-        return int(result.stdout.decode().strip().split()[0])
-    
-    # Function to get GPU memory usage
-    def get_gpu_memory_usage(self):
-        result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'], stdout=subprocess.PIPE)
-        return int(result.stdout.decode().strip().split()[0])
+        result = subprocess.run(
+            [
+                'nvidia-smi',
+                '--query-gpu=utilization.gpu,memory.used',
+                '--format=csv,noheader,nounits',
+            ],
+            stdout=subprocess.PIPE,
+        )
+        usage, memory = result.stdout.decode().strip().splitlines()[0].split(',')
+        return int(usage.strip()), int(memory.strip())
 
     def _log_train_info(self, train_info, frame):
         self.writer.add_scalar('performance/update_time', train_info['update_time'], frame)
@@ -589,10 +609,11 @@ class InterMimicAgent(common_agent.CommonAgent):
         self.writer.add_scalar('info/clip_frac', torch_ext.mean_list(train_info['actor_clip_frac']).item(), frame)
         self.writer.add_scalar('info/kl', torch_ext.mean_list(train_info['kl']).item(), frame)
 
+        gpu_usage, gpu_memory = self.get_gpu_usage()
         self.writer.add_scalar('usage/cpu', self.get_cpu_usage(), frame)
-        self.writer.add_scalar('usage/gpu', self.get_gpu_usage(), frame)
+        self.writer.add_scalar('usage/gpu', gpu_usage, frame)
         self.writer.add_scalar('usage/cpu_memory', self.get_cpu_memory_usage(), frame)
-        self.writer.add_scalar('usage/gpu_memory', self.get_gpu_memory_usage(), frame)
+        self.writer.add_scalar('usage/gpu_memory', gpu_memory, frame)
         return
 
     def _log_train_epoch(self, train_info, frame):
