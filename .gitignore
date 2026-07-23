@@ -3,6 +3,8 @@
 /body_models/
 /checkpoints/
 /tracking_intermediate_file/
+/third_party/
+/__MACOSX/
 .codex
 /logs/
 *__pycache__*
