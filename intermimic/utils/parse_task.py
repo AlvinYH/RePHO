@@ -54,14 +54,19 @@ def parse_task(args, cfg, cfg_train, sim_params):
     cfg_task["seed"] = cfg["seed"]
 
     try:
-        task = eval(args.task)( # to HumanoidLocation(), obs defined here!
+        if args.task == "RePHOArticulated":
+            from env.tasks.repho_articulated import RePHOArticulated
+            task_type = RePHOArticulated
+        else:
+            task_type = globals()[args.task]
+        task = task_type( # to HumanoidLocation(), obs defined here!
             cfg=cfg,
             sim_params=sim_params,
             physics_engine=args.physics_engine,
             device_type=args.device,
             device_id=device_id,
             headless=args.headless)
-    except NameError as e:
+    except KeyError as e:
         print(e)
         warn_task_name()
     env = VecTaskPythonWrapper(task, rl_device, cfg_train.get("clip_observations", np.inf), cfg_train.get("clip_actions", 1.0))
