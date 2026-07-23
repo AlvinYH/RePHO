@@ -251,9 +251,10 @@ class RePHOArticulated(InterMimic):
     def _load_target_asset(self):
         urdf = Path(self._art_config["urdf_path"]).expanduser().resolve()
         options = gymapi.AssetOptions()
+        options.fix_base_link = True
+        options.disable_gravity = True
         options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
         options.vhacd_enabled = self._art_config["isaac_vhacd_enabled"]
-        options.disable_gravity = bool(self.disable_gravity)
         asset = self.gym.load_asset(self.sim, str(urdf.parent), urdf.name, options)
         asset_joint_names = list(self.gym.get_asset_dof_names(asset))
         if asset_joint_names != self._art_joint_names:
@@ -703,20 +704,34 @@ class RePHOArticulated(InterMimic):
         distance, hand_force, region_force = self._contact_telemetry()
         frame = int(self._reference_frame()[0].item())
         body_state = self._rigid_body_state.view(self.num_envs, -1, 13)[0, :self.num_bodies]
-        self._art_rollout.append({
-            "human_root_state": self._humanoid_root_states[0].detach().cpu().numpy(),
-            "human_dof_pos": self._dof_pos[0].detach().cpu().numpy(),
-            "human_body_state": body_state.detach().cpu().numpy(),
-            "object_root_state": self._target_states[0].detach().cpu().numpy(),
-            "object_joint_qpos": self._target_dof_pos[0].detach().cpu().numpy(),
-            "object_joint_qpos_reference": self._art_qref[frame].detach().cpu().numpy(),
-            "object_link_state": self._target_body_state[0].detach().cpu().numpy(),
-            "region_distance_m": distance[0].detach().cpu().numpy(),
-            "intended": self._art_intended[min(frame, len(self._art_intended) - 1)].detach().cpu().numpy(),
-            "hand_force_n": hand_force[0].detach().cpu().numpy(),
-            "region_force_n": region_force[0].detach().cpu().numpy(),
-            "terminated": bool(self._terminate_buf[0].item()),
-        })
+        physics_rollout = {
+            "human": {
+                "human_root_state": self._humanoid_root_states[0].detach().cpu().numpy(),
+                "human_dof_pos": self._dof_pos[0].detach().cpu().numpy(),
+                "human_body_state": body_state.detach().cpu().numpy(),
+            },
+            "object": {
+                "object_root_state": self._target_states[0].detach().cpu().numpy(),
+                "object_joint_qpos": self._target_dof_pos[0].detach().cpu().numpy(),
+                "object_joint_qpos_reference": self._art_qref[
+                    frame
+                ].detach().cpu().numpy(),
+                "object_link_state": self._target_body_state[0].detach().cpu().numpy(),
+            },
+            "contact": {
+                "region_distance_m": distance[0].detach().cpu().numpy(),
+                "intended": self._art_intended[
+                    min(frame, len(self._art_intended) - 1)
+                ].detach().cpu().numpy(),
+                "hand_force_n": hand_force[0].detach().cpu().numpy(),
+                "region_force_n": region_force[0].detach().cpu().numpy(),
+            },
+            "policy": {
+                "terminated": bool(self._terminate_buf[0].item()),
+            },
+        }
+        self.extras["physics_rollout"] = physics_rollout
+        self._art_rollout.append(physics_rollout)
         if bool(self.reset_buf[0].item()) or frame >= self._art_qref.shape[0] - 1:
             self._write_rollout()
 
@@ -727,7 +742,11 @@ class RePHOArticulated(InterMimic):
             raise RuntimeError("Rollout finished before environment 0 recorded its object reset qpos")
         path = Path(self._art_rollout_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {key: np.stack([frame[key] for frame in self._art_rollout]) for key in self._art_rollout[0]}
+        payload = {
+            key: np.stack([frame[group][key] for frame in self._art_rollout])
+            for group, fields in self._art_rollout[0].items()
+            for key in fields
+        }
         valid_frames = len(self._art_rollout)
         total_frames = self._art_qref.shape[0] - 1
         if valid_frames > total_frames:
