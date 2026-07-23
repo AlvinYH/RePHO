@@ -348,6 +348,17 @@ class RePHOArticulated(InterMimic):
         if self._art_rollout_path and len(env_ids) and torch.any(env_ids == 0):
             self._last_env0_reset_qpos = self._target_dof_pos[0].detach().cpu().numpy().copy()
 
+    def _reset_actors(self, env_ids):
+        super()._reset_actors(env_ids)
+        frames = self.progress_buf[env_ids].long()
+        reference = self.hoi_data[self.data_id[env_ids], frames]
+        body_pos = self.extract_data_component("body_pos", obs=reference)
+        body_rot = self.extract_data_component("body_rot", obs=reference)
+        pos_end = body_pos.shape[-1]
+        rot_end = pos_end + body_rot.shape[-1]
+        self._curr_state_complement[env_ids, 0, :pos_end] = body_pos
+        self._curr_state_complement[env_ids, 0, pos_end:rot_end] = body_rot
+
     def _reset_env_tensors(self, env_ids):
         human_ids = self._humanoid_actor_ids[env_ids]
         object_ids = self._tar_actor_ids[env_ids]
