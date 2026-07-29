@@ -46,8 +46,9 @@ import shutil
 global terminate_flag
 
 class CommonAgent(a2c_continuous.A2CAgent):
-    def __init__(self, base_name, config):
-        a2c_common.A2CBase.__init__(self, base_name, config)
+    def __init__(self, base_name, params):
+        config = params["config"]
+        a2c_common.A2CBase.__init__(self, base_name, params)
         self.rank = getattr(self, 'rank', 0)
         self.rank_size = getattr(self, 'rank_size', 1)
         self._load_config_params(config)
@@ -81,7 +82,7 @@ class CommonAgent(a2c_continuous.A2CAgent):
                 'horizon_length' : self.horizon_length, 
                 'num_actors' : self.num_actors, 
                 'num_actions' : self.actions_num, 
-                'seq_len' : self.seq_len, 
+                'seq_length' : self.seq_length,
                 'model' : self.central_value_config['network'],
                 'config' : self.central_value_config, 
                 'writter' : self.writer,
@@ -90,7 +91,7 @@ class CommonAgent(a2c_continuous.A2CAgent):
             self.central_value_net = central_value.CentralValueTrain(**cv_config).to(self.ppo_device)
 
         self.use_experimental_cv = self.config.get('use_experimental_cv', True)
-        self.dataset = amp_datasets.AMPDataset(self.batch_size, self.minibatch_size, self.is_discrete, self.is_rnn, self.ppo_device, self.seq_len)
+        self.dataset = amp_datasets.AMPDataset(self.batch_size, self.minibatch_size, self.is_discrete, self.is_rnn, self.ppo_device, self.seq_length)
         self.algo_observer.after_init(self)
         
         return
@@ -498,7 +499,7 @@ class CommonAgent(a2c_continuous.A2CAgent):
         if self.is_rnn:
             rnn_masks = input_dict['rnn_masks']
             batch_dict['rnn_states'] = input_dict['rnn_states']
-            batch_dict['seq_length'] = self.seq_len
+            batch_dict['seq_length'] = self.seq_length
 
         with torch.cuda.amp.autocast(enabled=self.mixed_precision):
             res_dict = self.model(batch_dict)

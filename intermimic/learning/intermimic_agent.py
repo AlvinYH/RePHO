@@ -45,8 +45,8 @@ import learning.common_agent as common_agent
 from tensorboardX import SummaryWriter
 
 class InterMimicAgent(common_agent.CommonAgent):
-    def __init__(self, base_name, config):
-        super().__init__(base_name, config)
+    def __init__(self, base_name, params):
+        super().__init__(base_name, params)
 
         self.humanoid_rewards = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
         self.object_rewards = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
@@ -57,7 +57,7 @@ class InterMimicAgent(common_agent.CommonAgent):
 
         if self._normalize_input:
             self._input_mean_std = RunningMeanStd(self._amp_observation_space.shape).to(self.ppo_device)
-        self.resume_from = config['resume_from']
+        self.resume_from = self.config['resume_from']
         self.done_indices = []
 
         return
@@ -398,7 +398,7 @@ class InterMimicAgent(common_agent.CommonAgent):
         if self.is_rnn:
             rnn_masks = input_dict['rnn_masks']
             batch_dict['rnn_states'] = input_dict['rnn_states']
-            batch_dict['seq_length'] = self.seq_len
+            batch_dict['seq_length'] = self.seq_length
 
         with torch.cuda.amp.autocast(enabled=self.mixed_precision):
             res_dict = self.model(batch_dict)

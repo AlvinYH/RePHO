@@ -188,9 +188,10 @@ def build_alg_runner(algo_observer):
     runner = Runner(algo_observer)
 
     def build_agent(base_name, params, **_):
-        config = copy.deepcopy(params["config"])
-        config["network"] = model_builder.ModelBuilder().load(params)
-        return intermimic_agent.InterMimicAgent(base_name, config)
+        return intermimic_agent.InterMimicAgent(
+            base_name,
+            copy.deepcopy(params),
+        )
 
     runner.algo_factory.register_builder('intermimic', build_agent)
     runner.player_factory.register_builder('intermimic', lambda **kwargs : intermimic_players.InterMimicPlayerContinuous(**kwargs))
