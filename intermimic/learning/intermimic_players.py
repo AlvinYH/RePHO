@@ -34,10 +34,10 @@ from rl_games.algos_torch.running_mean_std import RunningMeanStd
 import learning.common_player as common_player
 
 class InterMimicPlayerContinuous(common_player.CommonPlayer):
-    def __init__(self, config):
-        self._normalize_amp_input = config.get('normalize_amp_input', False)
+    def __init__(self, params):
+        self._normalize_amp_input = params["config"].get('normalize_amp_input', False)
         
-        super().__init__(config)
+        super().__init__(params)
         return
 
     def run(self):
@@ -154,9 +154,11 @@ class InterMimicPlayerContinuous(common_player.CommonPlayer):
     
     def restore(self, fn):
         if (fn != 'Base'):
-            super().restore(fn)
+            checkpoint = torch_ext.load_checkpoint(fn)
+            self.model.load_state_dict(checkpoint['model'])
+            if self.normalize_input:
+                self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
             if self._normalize_amp_input:
-                checkpoint = torch_ext.load_checkpoint(fn)
                 self._amp_input_mean_std.load_state_dict(checkpoint['amp_input_mean_std'])
         return
     

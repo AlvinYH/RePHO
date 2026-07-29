@@ -8,28 +8,22 @@ cfg_env=$5
 cfg_train=$6
 current_epoch=$7
 init_range_left=$8
-task=${9:-InterMimic}
-sub_file_name=${10:-intermimic_vistracker}
-checkpoint_name=$(printf 'mimic_%08d.pth' "${current_epoch}")
 
-exec 9>"${TMPDIR:-/tmp}/repho_validation_gpu_${gpu_id}.lock"
-flock 9
-
-CUDA_VISIBLE_DEVICES="${gpu_id}" python intermimic/run.py \
-    --task "${task}" \
-    --cfg_env "${cfg_env}" \
-    --cfg_train "${cfg_train}" \
+CUDA_VISIBLE_DEVICES=${gpu_id} python intermimic/run.py \
+    --task InterMimic \
+    --cfg_env ${cfg_env} \
+    --cfg_train ${cfg_train} \
     --headless \
-    --output_path "${out_root}/${seq_name}_dual/backward/ref_tar/ref_tar_${current_epoch}" \
+    --output_path ${out_root}/${seq_name}_dual/backward/ref_tar/ref_tar_${current_epoch} \
     --stateInit Start \
-    --init_range_left "${init_range_left}" \
+    --init_range_left ${init_range_left} \
     --reverse_time \
     --device_id 0 \
     --rl_device cuda:0 \
-    --motion_file "${motion_root}/${seq_name}" \
-    --sub_file_name "${sub_file_name}" \
-    --checkpoint "${out_root}/${seq_name}_dual/backward/smplx/nn/${checkpoint_name}" \
-    --hoi_refs_path "${out_root}/${seq_name}_dual/backward/ref_hoi/ref_hoi_${current_epoch}.npz" \
-    --hoi_data_path "${out_root}/${seq_name}_dual/backward/hoi_data/intermimic_${current_epoch}.pt" \
+    --motion_file ${motion_root}/${seq_name} \
+    --sub_file_name intermimic_vistracker \
+    --checkpoint ${out_root}/${seq_name}_dual/backward/smplx/nn/mimic_000${current_epoch}.pth \
+    --hoi_refs_path ${out_root}/${seq_name}_dual/backward/ref_hoi/ref_hoi_${current_epoch}.npz \
+    --hoi_data_path ${out_root}/${seq_name}_dual/backward/hoi_data/intermimic_${current_epoch}.pt \
     --test --num_envs 1 --save_states
     

@@ -28,6 +28,7 @@
 
 from env.tasks.intermimic import InterMimic
 from env.tasks.intermimic_all import InterMimic_All
+from env.tasks.repho_articulated import RePHOArticulated
 try:
     from env.tasks.intermimic_g1 import InterMimicG1
 except ModuleNotFoundError:
@@ -54,19 +55,14 @@ def parse_task(args, cfg, cfg_train, sim_params):
     cfg_task["seed"] = cfg["seed"]
 
     try:
-        if args.task == "RePHOArticulated":
-            from env.tasks.repho_articulated import RePHOArticulated
-            task_type = RePHOArticulated
-        else:
-            task_type = globals()[args.task]
-        task = task_type( # to HumanoidLocation(), obs defined here!
+        task = eval(args.task)( # to HumanoidLocation(), obs defined here!
             cfg=cfg,
             sim_params=sim_params,
             physics_engine=args.physics_engine,
             device_type=args.device,
             device_id=device_id,
             headless=args.headless)
-    except KeyError as e:
+    except NameError as e:
         print(e)
         warn_task_name()
     env = VecTaskPythonWrapper(task, rl_device, cfg_train.get("clip_observations", np.inf), cfg_train.get("clip_actions", 1.0))

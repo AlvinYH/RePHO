@@ -48,6 +48,8 @@ global terminate_flag
 class CommonAgent(a2c_continuous.A2CAgent):
     def __init__(self, base_name, config):
         a2c_common.A2CBase.__init__(self, base_name, config)
+        self.rank = getattr(self, 'rank', 0)
+        self.rank_size = getattr(self, 'rank_size', 1)
         self._load_config_params(config)
 
         self.is_discrete = False
