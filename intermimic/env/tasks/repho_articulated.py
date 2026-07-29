@@ -150,15 +150,13 @@ class RePHOArticulated(InterMimic):
         global box_region_surface_distances
         global capsule_region_surface_distances
         global hand2_body_groups
-        global load_mjcf_body_boxes
-        global load_mjcf_body_capsules
+        global load_hand_collision_geometry
         from pipeline.physics.common_rollout import CommonRolloutRecorder, SMPLX_BODY_NAMES
         from pipeline.physics.contact import (
             box_region_surface_distances,
             capsule_region_surface_distances,
             hand2_body_groups,
-            load_mjcf_body_boxes,
-            load_mjcf_body_capsules,
+            load_hand_collision_geometry,
         )
         from pipeline.physics.articulated_scene import (
             ARTICULATED_OBJECT_COLLISION_FILTER,
@@ -260,10 +258,16 @@ class RePHOArticulated(InterMimic):
             ],
             dtype=np.int64,
         )
-        self._art_q0_np = self._art_qref_np[0].copy()
-        self._art_qvel0_np = (
-            self._art_qref_np[1] - self._art_qref_np[0]
-        ) * self._art_reference_fps
+        self._art_q0_np = np.asarray(
+            self._art_config["initial_joint_qpos"],
+            dtype=np.float32,
+        ).reshape(-1)
+        if (
+            self._art_q0_np.shape != (len(self._art_joint_names),)
+            or not np.isfinite(self._art_q0_np).all()
+        ):
+            raise ValueError("initial_joint_qpos must be finite and match object joints")
+        self._art_qvel0_np = np.zeros_like(self._art_q0_np)
         self._art_dof_count = len(self._art_joint_names)
         self._art_active_dof_count = len(self._art_active_joint_names)
         self._art_active_link_names = [
@@ -551,29 +555,11 @@ class RePHOArticulated(InterMimic):
 
     def _reset_target(self, env_ids):
         super()._reset_target(env_ids)
-        if self._art_qref is None:
-            reset_qpos = to_torch(
-                self._art_q0_np,
-                device=self.device,
-            ).expand(env_ids.shape[0], -1)
-            reset_qvel = to_torch(
-                self._art_qvel0_np,
-                device=self.device,
-            ).expand(env_ids.shape[0], -1)
-        else:
-            frames = torch.clamp(
-                self.progress_buf[env_ids].long(),
-                0,
-                self._art_qref.shape[0] - 1,
-            )
-            reset_qpos = self._art_qref[frames].clone()
-            next_frames = torch.clamp(
-                frames + 1,
-                max=self._art_qref.shape[0] - 1,
-            )
-            reset_qvel = (
-                self._art_qref[next_frames] - self._art_qref[frames]
-            ) * self._art_reference_fps
+        reset_qpos = to_torch(
+            self._art_q0_np,
+            device=self.device,
+        ).expand(env_ids.shape[0], -1)
+        reset_qvel = torch.zeros_like(reset_qpos)
         self._target_dof_pos[env_ids] = reset_qpos
         self._target_dof_vel[env_ids] = reset_qvel
         if self._art_rollout_terminated is not None:
@@ -596,7 +582,7 @@ class RePHOArticulated(InterMimic):
         if int(self.progress_buf[0].item()) != 0:
             raise RuntimeError("Formal articulated rollout must reset at reference frame 0")
 
-        # Store frame 0 immediately after the reference reset. The simulator
+        # Store frame 0 immediately after the case-init reset. The simulator
         # refreshes rigid bodies only after one step, so read the canonical
         # reset body state from hoi_data rather than stale rigid-body tensors.
         data_id = self.data_id[:1]
@@ -1017,11 +1003,15 @@ class RePHOArticulated(InterMimic):
         flat_body_ids = tuple(
             body_id for group in self._art_human_contact_groups for body_id in group
         )
-        capsule_endpoints, capsule_radii, capsule_valid = load_mjcf_body_capsules(
-            self._art_humanoid_mjcf_path,
-            [human_names[body_id] for body_id in flat_body_ids],
-        )
-        box_centers, box_quaternions, box_half_extents, box_valid = load_mjcf_body_boxes(
+        (
+            capsule_endpoints,
+            capsule_radii,
+            capsule_valid,
+            box_centers,
+            box_quaternions,
+            box_half_extents,
+            box_valid,
+        ) = load_hand_collision_geometry(
             self._art_humanoid_mjcf_path,
             [human_names[body_id] for body_id in flat_body_ids],
         )
