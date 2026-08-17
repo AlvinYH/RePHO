@@ -151,7 +151,7 @@ class RePHOArticulated(InterMimic):
         global capsule_region_surface_distances
         global hand2_body_groups
         global load_hand_collision_geometry
-        from pipeline.physics.common_rollout import CommonRolloutRecorder, SMPLX_BODY_NAMES
+        from pipeline.physics.common_rollout import SMPLX_BODY_NAMES, SMPLX_DOF_NAMES
         from pipeline.physics.contact import (
             box_region_surface_distances,
             capsule_region_surface_distances,
@@ -372,8 +372,8 @@ class RePHOArticulated(InterMimic):
         self._create_static_box_actors = create_static_box_actors
         self._load_articulated_asset = load_articulated_asset
         self._load_static_box_assets = load_static_box_assets
-        self._CommonRolloutRecorder = CommonRolloutRecorder
         self._common_human_body_names = SMPLX_BODY_NAMES
+        self._common_human_dof_names = SMPLX_DOF_NAMES
         self._art_q_weight = env["articulationRewardWeight"]
         self._art_link_weight = env["articulationLinkRewardWeight"]
         self._art_q_scale = env["articulationRewardScale"]
@@ -396,7 +396,8 @@ class RePHOArticulated(InterMimic):
             self._art_humanoid_mjcf_path
         )
         self._art_humanoid_offsets_np = offsets
-        self._art_recorder = None
+        self._art_rollout_frames = []
+        self._art_rollout_reference_body_position = None
         self._art_rollout_next_frame = None
         self._art_rollout_written = False
         self._art_rollout_terminated = None
@@ -436,14 +437,19 @@ class RePHOArticulated(InterMimic):
         if self._art_rollout_path:
             if self.num_envs != 1:
                 raise ValueError("common rollout recording requires exactly one environment")
-            self._art_recorder = self._CommonRolloutRecorder(
-                self._art_rollout_path,
-                fps=self._art_rollout_fps,
-                object_joint_qpos_reference=self._art_qref_np,
-                joint_names=self._art_joint_names,
-                joint_types=self._art_joint_types,
-                intended=self._art_intended_np,
-                contact_region_link_names=self._art_target_contact_link_names,
+            reference_frames = torch.arange(
+                self._art_qref_np.shape[0],
+                device=self.device,
+            )
+            reference_ids = self.data_id[:1].expand_as(reference_frames)
+            reference_body_pos = self.extract_data_component(
+                "body_pos",
+                ref=True,
+                data_id=reference_ids,
+                t=reference_frames,
+            ).reshape(len(reference_frames), self.num_bodies, 3)
+            self._art_rollout_reference_body_position = (
+                reference_body_pos.detach().cpu().numpy().astype(np.float32)
             )
 
     def _load_target_asset(self):
@@ -570,7 +576,7 @@ class RePHOArticulated(InterMimic):
         if self.mode == "test" and self.save_states:
             self._write_reset_body_cache(env_ids)
         if (
-            self._art_recorder is None
+            not self._art_rollout_path
             or self._art_rollout_written
             or self.num_envs != 1
             or self._art_qref is None
@@ -631,8 +637,7 @@ class RePHOArticulated(InterMimic):
             self._art_human_contact_box_valid,
             self._art_human_contact_local_groups,
         )[0]
-        self._art_recorder.append(
-            0,
+        self._art_rollout_frames.append(dict(
             human_root_state=self._humanoid_root_states[0].detach().cpu().numpy(),
             human_dof_pos=self._dof_pos[0].detach().cpu().numpy(),
             human_body_state=body_state.detach().cpu().numpy(),
@@ -641,7 +646,7 @@ class RePHOArticulated(InterMimic):
             region_distance_m=distance.detach().cpu().numpy(),
             hand_force_n=np.zeros(2, dtype=np.float32),
             region_force_n=np.zeros(link_count, dtype=np.float32),
-        )
+        ))
         self._art_rollout_next_frame = 1
 
     def _write_reset_body_cache(self, env_ids):
@@ -1171,7 +1176,7 @@ class RePHOArticulated(InterMimic):
         self._record_common_rollout_step()
 
     def _record_common_rollout_step(self):
-        if self._art_recorder is None or self._art_rollout_written:
+        if not self._art_rollout_path or self._art_rollout_written:
             return
         distance, hand_force, region_force = self._contact_telemetry()
         frame = int(self._reference_frame()[0].item())
@@ -1183,8 +1188,7 @@ class RePHOArticulated(InterMimic):
                 f"{self._art_rollout_next_frame}, got {frame}"
             )
         body_state = self._rigid_body_state.view(self.num_envs, -1, 13)[0, :self.num_bodies]
-        self._art_recorder.append(
-            frame,
+        self._art_rollout_frames.append(dict(
             human_root_state=self._humanoid_root_states[0].detach().cpu().numpy(),
             human_dof_pos=self._dof_pos[0].detach().cpu().numpy(),
             human_body_state=body_state.detach().cpu().numpy(),
@@ -1193,11 +1197,75 @@ class RePHOArticulated(InterMimic):
             region_distance_m=distance[0].detach().cpu().numpy(),
             hand_force_n=hand_force[0].detach().cpu().numpy(),
             region_force_n=region_force[0].detach().cpu().numpy(),
-        )
+        ))
         self._art_rollout_next_frame += 1
         if bool(self.reset_buf[0].item()) or frame >= self._art_qref.shape[0] - 1:
-            self._art_recorder.seal()
+            self._write_common_rollout()
             self._art_rollout_written = True
+
+    def _write_common_rollout(self):
+        total_frames = len(self._art_qref_np)
+        valid_frames = len(self._art_rollout_frames)
+        if not 1 <= valid_frames <= total_frames:
+            raise RuntimeError("RePHO rollout frames do not match the reference")
+
+        def states(name):
+            values = np.stack(
+                [frame[name] for frame in self._art_rollout_frames]
+            ).astype(np.float32)
+            if valid_frames < total_frames:
+                values = np.concatenate(
+                    (
+                        values,
+                        np.broadcast_to(
+                            values[-1],
+                            (total_frames - valid_frames, *values.shape[1:]),
+                        ),
+                    ),
+                    axis=0,
+                )
+            return values
+
+        def forces(name):
+            values = np.stack(
+                [frame[name] for frame in self._art_rollout_frames]
+            ).astype(np.float32)
+            if valid_frames < total_frames:
+                values = np.concatenate(
+                    (
+                        values,
+                        np.zeros(
+                            (total_frames - valid_frames, *values.shape[1:]),
+                            dtype=np.float32,
+                        ),
+                    ),
+                    axis=0,
+                )
+            return values
+
+        np.savez_compressed(
+            self._art_rollout_path,
+            fps=np.asarray(self._art_rollout_fps, dtype=np.float32),
+            valid_frame_count=np.asarray(valid_frames, dtype=np.int64),
+            human_root_state=states("human_root_state"),
+            human_dof_pos=states("human_dof_pos"),
+            human_body_state=states("human_body_state"),
+            human_body_position_reference=self._art_rollout_reference_body_position,
+            human_body_names=np.asarray(self._common_human_body_names),
+            human_dof_names=np.asarray(self._common_human_dof_names),
+            object_root_state=states("object_root_state"),
+            object_joint_qpos=states("object_joint_qpos"),
+            object_joint_qpos_reference=self._art_qref_np.astype(np.float32),
+            joint_names=np.asarray(self._art_joint_names),
+            joint_types=np.asarray(self._art_joint_types),
+            region_distance_m=states("region_distance_m"),
+            intended=np.asarray(self._art_intended_np, dtype=np.bool_),
+            hand_force_n=forces("hand_force_n"),
+            region_force_n=forces("region_force_n"),
+            contact_region_link_names=np.asarray(
+                self._art_target_contact_link_names
+            ),
+        )
 
 
 __all__ = ["RePHOArticulated"]
