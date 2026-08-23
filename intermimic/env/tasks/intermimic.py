@@ -2,6 +2,7 @@ from enum import Enum
 import numpy as np
 import torch
 import os
+from pathlib import Path
 
 from isaacgym import gymtorch
 from isaacgym import gymapi
@@ -18,6 +19,15 @@ import time
 import json
 import xml.etree.ElementTree as ET
 
+
+def _shared_arctic_physics_cache() -> Path:
+    """Locate the repository-owned fixed ARCTIC collision cache."""
+
+    for parent in Path(__file__).resolve().parents:
+        cache_root = parent / "data" / "ARCTIC" / "physics_cache"
+        if cache_root.is_dir():
+            return cache_root
+    raise FileNotFoundError("Could not locate data/ARCTIC/physics_cache from RePHO")
 
 
 class InterMimic(Humanoid_SMPLX):
@@ -42,7 +52,6 @@ class InterMimic(Humanoid_SMPLX):
         self.reverse_time = cfg["env"].get("reverse_time", False)
         self._hybrid_init_prob = cfg["env"]["hybridInitProb"]
         self.save_states = cfg["env"].get("save_states", False)
-        self.disable_gravity = cfg["env"].get("disable_gravity", False)
         self._reset_default_env_ids = []
         self._reset_ref_env_ids = []
         self.motion_file = cfg['env']['motion_file']
@@ -74,7 +83,6 @@ class InterMimic(Humanoid_SMPLX):
         self.object_id = to_torch([object_name_set.index(name) for name in self.object_name], dtype=torch.long, device=self.device)
         self.obj2motion = torch.stack([self.object_id == k for k in range(len(object_name_set))], dim=0)
         self.object_name = object_name_set
-        self.object_density = cfg['env']['objectDensity']
         self.ref_hoi_obs_size = 7 + 51 * 6 + 52 * 13 + 13 + 52 * 3 + 52 + 1
         self.num_motions = len(self.motion_file)
         self.dataset_index = to_torch([0], dtype=torch.long, device=self.device)
@@ -773,7 +781,7 @@ class InterMimic(Humanoid_SMPLX):
         return np.eye(3, dtype=np.float64) + skew + skew @ skew * (1.0 / (1.0 + dot))
 
     def _load_target_asset(self): # smplx
-        
+        physics_cache_root = _shared_arctic_physics_cache()
         self._target_asset = []
         points_num = []
         self.object_points = []
@@ -782,26 +790,26 @@ class InterMimic(Humanoid_SMPLX):
         for i, object_name in enumerate(self.object_name):
 
             asset_file = object_name + ".urdf"
-            asset_root = os.path.join(self.root_file_path, object_name)
-            obj_file = asset_root+ '/' + object_name + '.obj'
-            max_convex_hulls = 64
-            density = self.object_density
+            asset_root = physics_cache_root / object_name
+            if not (asset_root / asset_file).is_file():
+                raise FileNotFoundError(
+                    f"Missing fixed ARCTIC physics asset for {object_name}: {asset_root / asset_file}"
+                )
+            obj_file = os.path.join(self.root_file_path, object_name, object_name + '.obj')
         
             asset_options = gymapi.AssetOptions()
             asset_options.angular_damping = 0.01
             asset_options.linear_damping = 0.01
-
-            asset_options.density = density
+            asset_options.fix_base_link = False
+            asset_options.disable_gravity = False
+            asset_options.override_com = False
+            asset_options.override_inertia = False
             asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
-            asset_options.vhacd_enabled = True
-            asset_options.vhacd_params.max_convex_hulls = max_convex_hulls
-            asset_options.vhacd_params.max_num_vertices_per_ch = 64
-            asset_options.vhacd_params.resolution = 300000
-            if self.disable_gravity:
-                asset_options.disable_gravity = True
+            # The cache URDF already references the fixed offline VHACD hulls.
+            asset_options.vhacd_enabled = False
 
 
-            self._target_asset.append(self.gym.load_asset(self.sim, asset_root, asset_file, asset_options))
+            self._target_asset.append(self.gym.load_asset(self.sim, str(asset_root), asset_file, asset_options))
 
             mesh_obj = trimesh.load(obj_file, force='mesh')
             obj_verts = mesh_obj.vertices
@@ -831,15 +839,11 @@ class InterMimic(Humanoid_SMPLX):
 
         props = self.gym.get_actor_rigid_shape_properties(env_ptr, target_handle)
         for p_idx in range(len(props)):
-            props[p_idx].restitution = 0.1 #0.6
-            props[p_idx].friction = 0.8 #0.8
-            props[p_idx].rolling_friction = 0.01
-            props[p_idx].torsion_friction = 0.8
-            if self.thin_obj:
-                props[p_idx].thickness = 0.002
-            if not self.thin_obj:
-                # props[p_idx].rest_offset = 0.015
-                props[p_idx].rest_offset = 0.015
+            props[p_idx].restitution = self.cfg["env"]["shapeRestitution"]
+            props[p_idx].friction = self.cfg["env"]["shapeFriction"]
+            props[p_idx].rolling_friction = self.cfg["env"]["shapeRollingFriction"]
+            props[p_idx].torsion_friction = self.cfg["env"]["shapeTorsionFriction"]
+            props[p_idx].rest_offset = self.cfg["env"]["shapeRestOffset"]
         self.gym.set_actor_rigid_shape_properties(env_ptr, target_handle, props)
 
         self._target_handles.append(target_handle)

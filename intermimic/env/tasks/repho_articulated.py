@@ -20,6 +20,65 @@ from env.tasks.intermimic import InterMimic, compute_sdf
 from utils import torch_utils
 
 
+_OBJECT_SURFACE_CONTACT_DISTANCE_M = 0.04
+_OBJECT_SURFACE_CONTACT_FORCE_N = 0.001
+
+
+def _object_surface_contact_reward(
+    *,
+    intended,
+    distance,
+    hand_force,
+    link_force,
+    distance_threshold,
+    force_threshold,
+    missing_weight,
+):
+    """Reward intended hand contact only when it reaches the active link."""
+
+    if intended.shape != hand_force.shape or intended.ndim != 2:
+        raise ValueError("intended and hand_force must share shape (envs, hands)")
+    if distance.ndim != 3 or distance.shape[:2] != intended.shape:
+        raise ValueError("distance must have shape (envs, hands, object_links)")
+    if link_force.shape != (intended.shape[0], distance.shape[2]):
+        raise ValueError("link_force must have shape (envs, object_links)")
+
+    intended_contact = intended > 0.1
+    near_link = distance <= distance_threshold
+    loaded_hand = hand_force >= force_threshold
+    loaded_link = link_force[:, None, :] >= force_threshold
+    live_contact = loaded_hand & torch.any(near_link & loaded_link, dim=2)
+    nearest_distance = distance.amin(dim=2)
+    floor = 0.5 * (
+        1.0
+        + torch.exp(
+            torch.as_tensor(
+                -float(missing_weight),
+                dtype=nearest_distance.dtype,
+                device=nearest_distance.device,
+            )
+        )
+    )
+    proximity = torch.exp(
+        -nearest_distance.clamp_min(0.0) / float(distance_threshold)
+    )
+    proximity = torch.where(
+        torch.isfinite(proximity), proximity, torch.zeros_like(proximity)
+    )
+    score = torch.where(
+        live_contact,
+        torch.ones_like(proximity),
+        0.5 * proximity,
+    )
+    reward = torch.where(
+        intended_contact,
+        floor + (1.0 - floor) * score,
+        torch.ones_like(score),
+    )
+    error = (intended_contact & ~live_contact).to(dtype=distance.dtype)
+    return reward, error, live_contact
+
+
 def _link_poses_in_object_frame(reference):
     """Express reference link poses in the reference object-root frame."""
 
@@ -171,13 +230,23 @@ class RePHOArticulated(InterMimic):
 
         env = cfg["env"]
         self._object_collision_filter = ARTICULATED_OBJECT_COLLISION_FILTER
-        self._static_collision_filter = STATIC_SCENE_COLLISION_FILTER
         self._add_ground_plane = add_ground_plane
         self._validate_humanoid_object_collision_filters = (
             validate_humanoid_object_collision_filters
         )
         manifest_path = Path(env["articulatedInputPath"]).expanduser().resolve()
         self._art_config = json.loads(manifest_path.read_text(encoding="utf-8"))
+        static_collision_filter = self._art_config.get(
+            "static_box_collision_filter",
+            STATIC_SCENE_COLLISION_FILTER,
+        )
+        if (
+            isinstance(static_collision_filter, bool)
+            or not isinstance(static_collision_filter, int)
+            or static_collision_filter < 0
+        ):
+            raise ValueError("static_box_collision_filter must be a non-negative integer")
+        self._static_collision_filter = static_collision_filter
         with np.load(
             Path(self._art_config["reference_path"]).expanduser().resolve(),
             allow_pickle=False,
@@ -211,20 +280,28 @@ class RePHOArticulated(InterMimic):
                 str(value) for value in np.asarray(values["body_names"]).tolist()
             ]
             self._art_intended_np = np.asarray(values["intended"], dtype=np.bool_)
-            self._art_contact_points_np = np.asarray(
-                values["contact_points_link_local_scaled"], dtype=np.float32
+            self._art_object_surface_mode = str(
+                np.asarray(values["object_surface_mode"]).item()
             )
-            self._art_contact_point_links = [
+            self._art_surface_points_np = np.asarray(
+                values["object_surface_points_link_local_scaled"], dtype=np.float32
+            )
+            self._art_surface_link_names = [
                 str(value)
-                for value in np.asarray(values["contact_point_link_names"]).tolist()
+                for value in np.asarray(
+                    values["object_surface_point_link_names"]
+                ).tolist()
             ]
-            self._art_contact_region_link_names = [
+            self._art_collision_points_np = np.asarray(
+                values["collision_surface_points_link_local_scaled"], dtype=np.float32
+            )
+            self._art_collision_point_link_names = [
                 str(value)
-                for value in np.asarray(values["contact_region_link_names"]).tolist()
+                for value in np.asarray(
+                    values["collision_surface_point_link_names"]
+                ).tolist()
             ]
             self._art_reference_fps = float(np.asarray(values["fps"]).item())
-            parent_points = np.asarray(values["active_parent_points"], dtype=np.float32)
-            child_points = np.asarray(values["active_child_points"], dtype=np.float32)
         if bool(env.get("reverse_time", False)):
             object_root_pos = object_root_pos[::-1].copy()
             object_root_rot = object_root_rot[::-1].copy()
@@ -351,23 +428,46 @@ class RePHOArticulated(InterMimic):
             raise ValueError("Object q reference must be finite")
         if self._art_intended_np.shape != (self._art_qref_np.shape[0], 2):
             raise ValueError("intended contact must have shape (frames, 2)")
-        if self._art_contact_points_np.shape != (
-            len(self._art_contact_point_links),
-            3,
-        ):
-            raise ValueError("Contact region points and point-link names disagree")
+        if self._art_object_surface_mode not in {"active_part", "full_object"}:
+            raise ValueError(
+                "object_surface_mode must be 'active_part' or 'full_object'"
+            )
         if (
-            not self._art_contact_region_link_names
-            or len(set(self._art_contact_region_link_names))
-            != len(self._art_contact_region_link_names)
-            or set(self._art_contact_point_links)
-            != set(self._art_contact_region_link_names)
+            self._art_surface_points_np.shape != (1024, 3)
+            or len(self._art_surface_link_names) != 1024
+            or not np.isfinite(self._art_surface_points_np).all()
         ):
-            raise ValueError("Canonical contact-region names and points disagree")
-        self._art_object_points_np = np.concatenate(
-            (parent_points.reshape(-1, 3), child_points.reshape(-1, 3)),
-            axis=0,
+            raise ValueError("RePHO requires exactly 1,024 finite object-surface points")
+        if (
+            self._art_collision_points_np.ndim != 2
+            or self._art_collision_points_np.shape[1:] != (3,)
+            or len(self._art_collision_point_link_names)
+            != self._art_collision_points_np.shape[0]
+            or not len(self._art_collision_point_link_names)
+            or not np.isfinite(self._art_collision_points_np).all()
+        ):
+            raise ValueError("RePHO collision-surface points and point-link names disagree")
+        all_links = set(self._art_link_names)
+        surface_links = set(self._art_surface_link_names)
+        collision_links = set(self._art_collision_point_link_names)
+        if not surface_links or not collision_links:
+            raise ValueError("RePHO object-surface and collision-surface links are required")
+        if not surface_links.issubset(all_links) or not collision_links.issubset(
+            all_links
+        ):
+            raise ValueError(
+                "Object-surface links must be present in the object reference"
+            )
+        if self._art_object_surface_mode == "active_part":
+            active_links = set(self._art_active_link_names)
+            if surface_links != active_links or collision_links != active_links:
+                raise ValueError(
+                    "active_part requires object and collision surfaces on active child links"
+                )
+        self._art_collision_link_names = tuple(
+            dict.fromkeys(self._art_collision_point_link_names)
         )
+        self._art_object_points_np = self._art_surface_points_np
         self._configure_articulated_actor = configure_articulated_actor
         self._create_static_box_actors = create_static_box_actors
         self._load_articulated_asset = load_articulated_asset
@@ -402,6 +502,7 @@ class RePHOArticulated(InterMimic):
         self._art_rollout_written = False
         self._art_rollout_terminated = None
         self._art_qref = None
+        self._static_box_handles = []
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
         self._art_qref = torch.as_tensor(self._art_qref_np, device=self.device)
         self._art_link_local = torch.as_tensor(
@@ -451,6 +552,8 @@ class RePHOArticulated(InterMimic):
             self._art_rollout_reference_body_position = (
                 reference_body_pos.detach().cpu().numpy().astype(np.float32)
             )
+        from scripts.physics.capture_isaac_runtime import request_task_physics_dump
+        request_task_physics_dump(self)
 
     def _load_target_asset(self):
         asset, properties = self._load_articulated_asset(
@@ -531,7 +634,7 @@ class RePHOArticulated(InterMimic):
             env_ptr,
             self.humanoid_handles[env_id],
         )
-        self._create_static_box_actors(
+        handles = self._create_static_box_actors(
             self.gym,
             env_ptr,
             env_id,
@@ -539,6 +642,8 @@ class RePHOArticulated(InterMimic):
             self._art_config,
             collision_filter=self._static_collision_filter,
         )
+        if env_id == 0:
+            self._static_box_handles = handles
 
     def _build_target_tensors(self):
         num_actors = self.get_num_actors_per_env()
@@ -573,6 +678,8 @@ class RePHOArticulated(InterMimic):
 
     def _reset_envs(self, env_ids):
         super()._reset_envs(env_ids)
+        from scripts.physics.capture_isaac_runtime import write_requested_task_physics
+        write_requested_task_physics(self)
         if self.mode == "test" and self.save_states:
             self._write_reset_body_cache(env_ids)
         if (
@@ -736,6 +843,60 @@ class RePHOArticulated(InterMimic):
     def _reference_frame(self):
         return torch.clamp(self.progress_buf.long(), 0, self._art_qref.shape[0] - 1)
 
+    def _object_surface_points(self, body_state):
+        """Place the selected object surface on the simulated link bodies."""
+
+        point_state = body_state[:, self._art_surface_body_ids]
+        local_points = self._art_surface_points.unsqueeze(0).expand(
+            len(body_state), -1, -1
+        )
+        return torch_utils.quat_rotate(
+            point_state[..., 3:7].reshape(-1, 4), local_points.reshape(-1, 3)
+        ).view(len(body_state), -1, 3) + point_state[..., :3]
+
+    def _reference_object_surface_points(self, frames, reference_observation):
+        """Place the selected object surface on the reference link FK."""
+
+        reference_links = _place_links_at_object_root(
+            {
+                "pos": self.extract_data_component(
+                    "obj_pos", obs=reference_observation
+                ),
+                "rot": self.extract_data_component(
+                    "obj_rot", obs=reference_observation
+                ),
+            },
+            {
+                "pos": self._art_link_local[frames][:, self._art_surface_reference_link_ids],
+                "rot": self._art_link_local_rot[frames][:, self._art_surface_reference_link_ids],
+            },
+        )
+        local_points = self._art_surface_points.unsqueeze(0).expand(
+            len(frames), -1, -1
+        )
+        return torch_utils.quat_rotate(
+            reference_links["rot"].reshape(-1, 4), local_points.reshape(-1, 3)
+        ).view(len(frames), -1, 3) + reference_links["pos"]
+
+    def _reference_human_interaction_graph(self):
+        """Build the author reference graph from the selected FK surface."""
+
+        frames = self._reference_frame()
+        body_pos = self.extract_data_component(
+            "body_pos", obs=self._curr_ref_obs
+        ).view(self.num_envs, -1, 3)
+        object_points = self._reference_object_surface_points(
+            frames, self._curr_ref_obs
+        )
+        graph = compute_sdf(body_pos, object_points)
+        heading = torch_utils.calc_heading_quat_inv(
+            self.extract_data_component("root_rot", obs=self._curr_ref_obs)
+        )
+        return torch_utils.quat_rotate(
+            heading.unsqueeze(1).expand(-1, body_pos.shape[1], -1).reshape(-1, 4),
+            graph.reshape(-1, 3),
+        ).view_as(graph)
+
     def _compute_observations(self, env_ids=None):
         if env_ids is None:
             env_ids = to_torch(
@@ -808,33 +969,10 @@ class RePHOArticulated(InterMimic):
         )
 
     def _art_graph_observation(self, env_ids, ref_obs, next_ts):
-        live_state = self._target_body_state[env_ids][
-            :, self._art_contact_point_body_ids
-        ]
-        local_points = self._art_contact_points.unsqueeze(0).expand(
-            len(env_ids), -1, -1
+        live_points = self._object_surface_points(
+            self._target_body_state[env_ids]
         )
-        live_points = torch_utils.quat_rotate(
-            live_state[..., 3:7].reshape(-1, 4), local_points.reshape(-1, 3)
-        ).view(len(env_ids), -1, 3) + live_state[..., :3]
-
-        ref_links = _place_links_at_object_root(
-            {
-                "pos": self.extract_data_component("obj_pos", obs=ref_obs),
-                "rot": self.extract_data_component("obj_rot", obs=ref_obs),
-            },
-            {
-                "pos": self._art_link_local[next_ts][
-                    :, self._art_graph_reference_link_ids
-                ],
-                "rot": self._art_link_local_rot[next_ts][
-                    :, self._art_graph_reference_link_ids
-                ],
-            },
-        )
-        ref_points = torch_utils.quat_rotate(
-            ref_links["rot"].reshape(-1, 4), local_points.reshape(-1, 3)
-        ).view(len(env_ids), -1, 3) + ref_links["pos"]
+        ref_points = self._reference_object_surface_points(next_ts, ref_obs)
 
         live_ig = self._art_encode_graph(
             self._rigid_body_pos[env_ids],
@@ -863,6 +1001,109 @@ class RePHOArticulated(InterMimic):
         ).view_as(graph)
         norm = torch.linalg.norm(graph, dim=-1, keepdim=True)
         return graph / (norm + 1e-6) * torch.exp(-5.0 * norm)
+
+    def compute_humanoid_reward(self, weights):
+        """Keep the author formula while replacing its rigid reference surface."""
+
+        key_count = len(self._key_body_ids)
+        all_pos = self.extract_data_component(
+            "body_pos", obs=self._curr_obs
+        ).view(self._curr_obs.shape[0], -1, 3)
+        key_pos = all_pos[:, self._key_body_ids]
+        ref_all_pos = self.extract_data_component(
+            "body_pos", obs=self._curr_ref_obs
+        ).view(self._curr_ref_obs.shape[0], -1, 3)
+        ref_key_pos = ref_all_pos[:, self._key_body_ids]
+
+        if self.reward_2d and weights.get("p_2d", 0) > 0:
+            key_2d, _ = self.project_points_to_camera(key_pos)
+            ref_key_2d, _ = self.project_points_to_camera(ref_key_pos)
+            ref_key_2d_pure = self.pure_2d_key[
+                self.progress_buf - self.start_times
+            ][:, self._key_body_ids]
+
+        reference_ig = self._reference_human_interaction_graph()
+        weight_h = (-5.0 * reference_ig.norm(dim=-1)).exp()
+        weight_hp = weight_h.clone().detach()
+        ankle_toe_ids = [
+            index + 1
+            for index in range(key_count)
+            if "Ankle" in self.key_bodies[index]
+            or "Toe" in self.key_bodies[index]
+        ]
+        weight_hp[:, ankle_toe_ids] = 0.5
+        position_error = torch.mean(
+            (ref_key_pos - key_pos).square().sum(dim=-1)
+            * weight_hp[:, self._key_body_ids],
+            dim=-1,
+        )
+        position_reward = torch.exp(-position_error * weights["p"])
+
+        if self.reward_2d and weights.get("p_2d", 0) > 0:
+            error_2d = torch.mean(
+                (ref_key_2d_pure - key_2d).square().sum(dim=-1), dim=-1
+            )
+            reward_2d = torch.exp(-error_2d * weights.get("p_2d", 0))
+        else:
+            error_2d = torch.zeros_like(position_error)
+            reward_2d = torch.ones_like(position_reward)
+
+        body_rot = self.extract_data_component(
+            "body_rot", obs=self._curr_obs
+        ).view(self._curr_obs.shape[0], -1, 4)
+        ref_body_rot = self.extract_data_component(
+            "body_rot", obs=self._curr_ref_obs
+        ).view(self._curr_ref_obs.shape[0], -1, 4)
+        difference = torch_utils.quat_mul_norm(
+            torch_utils.quat_inverse(ref_body_rot.reshape(-1, 4)),
+            body_rot.reshape(-1, 4),
+        )
+        angle, _ = torch_utils.quat_to_angle_axis(difference)
+        rotation_error = torch.mean(
+            angle.view(-1, 52) * (1.0 - weight_h), dim=-1
+        )
+        rotation_reward = torch.exp(-rotation_error * weights["r"])
+
+        velocity_error = torch.mean(
+            (
+                self.extract_data_component("body_pos_vel", obs=self._curr_ref_obs)
+                - self.extract_data_component("body_pos_vel", obs=self._curr_obs)
+            ).square(),
+            dim=-1,
+        )
+        velocity_reward = torch.exp(-velocity_error * weights["pv"])
+        angular_velocity_error = torch.mean(
+            (
+                self.extract_data_component("body_rot_vel", obs=self._curr_ref_obs)
+                - self.extract_data_component("body_rot_vel", obs=self._curr_obs)
+            ).square(),
+            dim=-1,
+        )
+        angular_velocity_reward = torch.exp(
+            -angular_velocity_error * weights["rv"]
+        )
+        dof_acceleration = (
+            self.extract_data_component("dof_vel", obs=self._curr_obs)
+            - self.extract_data_component("dof_vel", obs=self._hist_obs)
+        ) * self.fps_data
+        dof_acceleration *= (
+            self.progress_buf - self.start_times > 2
+        ).float().unsqueeze(-1)
+        energy_reward = torch.exp(
+            -dof_acceleration.view(-1, 51 * 3).square().mean(dim=-1)
+            * weights["eg1"]
+        )
+        self.key_error = error_2d
+        reward = (
+            position_reward
+            * rotation_reward
+            * velocity_reward
+            * angular_velocity_reward
+            * energy_reward
+            * reward_2d
+        )
+        reset = (ref_key_pos - key_pos).norm(dim=-1).mean(dim=-1) > 0.5
+        return reward, reset, key_pos, ref_key_pos, all_pos, ref_all_pos
 
     def _compute_reset(self):
         super()._compute_reset()
@@ -934,8 +1175,15 @@ class RePHOArticulated(InterMimic):
         command_path.write_text(" ".join(command), encoding="utf-8")
 
     def compute_obj_reward(self, weights):
-        native, reset, obj_points, ref_obj_points = super().compute_obj_reward(weights)
+        native, _unused_reset, _unused_points, _unused_reference_points = (
+            super().compute_obj_reward(weights)
+        )
         frames = self._reference_frame()
+        obj_points = self._object_surface_points(self._target_body_state)
+        ref_obj_points = self._reference_object_surface_points(
+            frames, self._curr_ref_obs
+        )
+        reset = (obj_points - ref_obj_points).norm(dim=-1).mean(dim=-1) > 0.5
         if self._art_active_dof_count:
             q_reward = torch.exp(
                 -self._art_q_scale
@@ -983,6 +1231,72 @@ class RePHOArticulated(InterMimic):
         )
         return reward, reset, obj_points, ref_obj_points
 
+    def compute_cg_reward(self, weights):
+        """Keep the author contact formula but gate hands on the selected collision surface."""
+
+        contact_threshold = 0.1
+        frames = self._reference_frame()
+        intended = (self._art_intended[frames] > contact_threshold).float()
+        distance, hand_force, link_force = self._contact_telemetry()
+        hand_reward, hand_error, live_contact = _object_surface_contact_reward(
+            intended=intended,
+            distance=distance,
+            hand_force=hand_force,
+            link_force=link_force,
+            distance_threshold=_OBJECT_SURFACE_CONTACT_DISTANCE_M,
+            force_threshold=_OBJECT_SURFACE_CONTACT_FORCE_N,
+            missing_weight=weights["cg_hand"],
+        )
+
+        human_contact = self.extract_data_component(
+            "contact_human", obs=self._curr_obs
+        )
+        hand_ids = set(range(17, 33)) | set(range(36, 52))
+        other_ids = [
+            index for index in range(len(self.contact_bodies)) if index not in hand_ids
+        ]
+        ref_other_contact = self.extract_data_component(
+            "contact_human", obs=self._curr_ref_obs
+        )[:, other_ids]
+        other_contact = human_contact[:, other_ids]
+        other_error = (
+            torch.abs(other_contact - ref_other_contact)
+            * (ref_other_contact > contact_threshold)
+        ).mean(dim=-1)
+        other_reward = torch.exp(-other_error * weights["cg_other"])
+        no_contact = torch.abs(other_contact) < contact_threshold
+        prohibited_error = (
+            torch.abs(no_contact + ref_other_contact)
+            * (ref_other_contact < -contact_threshold)
+        ).mean(dim=-1)
+        prohibited_reward = torch.exp(-prohibited_error * weights["cg_all"])
+        contact_energy = self._contact_forces.abs().sum(dim=-1).sum(dim=-1)
+        energy_reward = torch.exp(-contact_energy.pow(2) * weights["eg3"])
+        reward = (
+            hand_reward.prod(dim=1)
+            * other_reward
+            * prohibited_reward
+            * energy_reward
+        )
+        self.extras["object_surface_contact_reward"] = hand_reward.mean(dim=1)
+        self.extras["object_surface_contact_live"] = live_contact.float().mean(dim=1)
+        nearest_distance = distance.amin(dim=2)
+        self.extras["object_surface_contact_distance_m"] = torch.where(
+            torch.isfinite(nearest_distance),
+            nearest_distance,
+            torch.zeros_like(nearest_distance),
+        ).mean(dim=1)
+        contact_reset = torch.cat(
+            (
+                hand_error[:, :1],
+                hand_error[:, 1:],
+                hand_error[:, :1],
+                hand_error[:, 1:],
+            ),
+            dim=1,
+        )
+        return reward, contact_reset
+
     def _build_articulation_telemetry(self):
         target_lookup = {name: i for i, name in enumerate(self._target_asset_body_names)}
         missing_links = [name for name in self._art_link_names if name not in target_lookup]
@@ -998,6 +1312,21 @@ class RePHOArticulated(InterMimic):
         )
         self._art_ref_link_ids = torch.as_tensor(
             [reference_lookup[name] for name in self._art_active_link_names],
+            device=self.device,
+            dtype=torch.long,
+        )
+        self._art_surface_points = torch.as_tensor(
+            self._art_surface_points_np,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._art_surface_body_ids = torch.as_tensor(
+            [target_lookup[name] for name in self._art_surface_link_names],
+            device=self.device,
+            dtype=torch.long,
+        )
+        self._art_surface_reference_link_ids = torch.as_tensor(
+            [reference_lookup[name] for name in self._art_surface_link_names],
             device=self.device,
             dtype=torch.long,
         )
@@ -1068,22 +1397,28 @@ class RePHOArticulated(InterMimic):
         self._art_human_contact_box_valid = torch.as_tensor(
             box_valid, device=self.device
         )
-        region_names = tuple(self._art_contact_region_link_names)
+        region_names = self._art_collision_link_names
         missing_region_links = sorted(set(region_names).difference(target_lookup))
         if missing_region_links:
-            raise ValueError(f"Contact region links are absent from the loaded URDF: {missing_region_links}")
+            raise ValueError(f"Collision-surface links are absent from the loaded URDF: {missing_region_links}")
         self._art_target_contact_link_names = region_names
         target_local = [target_lookup[name] for name in region_names]
         self._art_target_contact_body_ids = torch.as_tensor(
             target_local, device=self.device, dtype=torch.long
         )
         missing_point_links = [
-            name for name in self._art_contact_point_links if name not in target_lookup
+            name
+            for name in self._art_collision_point_link_names
+            if name not in target_lookup
         ]
         if missing_point_links:
-            raise ValueError("A contact-region point refers to an unresolved object link")
-        point_body_ids = [target_lookup[name] for name in self._art_contact_point_links]
-        self._art_contact_points = torch.as_tensor(self._art_contact_points_np, device=self.device)
+            raise ValueError("A collision-surface point refers to an unresolved object link")
+        point_body_ids = [
+            target_lookup[name] for name in self._art_collision_point_link_names
+        ]
+        self._art_contact_points = torch.as_tensor(
+            self._art_collision_points_np, device=self.device
+        )
         self._art_contact_point_body_ids = torch.as_tensor(
             point_body_ids, device=self.device, dtype=torch.long
         )
@@ -1092,31 +1427,31 @@ class RePHOArticulated(InterMimic):
             for index, name in enumerate(self._art_target_contact_link_names)
         }
         self._art_contact_point_link_ids = torch.as_tensor(
-            [point_link_lookup[name] for name in self._art_contact_point_links],
+            [
+                point_link_lookup[name]
+                for name in self._art_collision_point_link_names
+            ],
             device=self.device,
             dtype=torch.long,
         )
         missing_reference_links = sorted(
-            set(self._art_contact_point_links).difference(reference_lookup)
+            set(self._art_collision_point_link_names).difference(reference_lookup)
         )
         if missing_reference_links:
             raise ValueError(
-                "Contact-region links are absent from object reference: "
+                "Collision-surface links are absent from object reference: "
                 f"{missing_reference_links}"
             )
         self._art_contact_point_reference_link_ids = torch.as_tensor(
-            [reference_lookup[name] for name in self._art_contact_point_links],
+            [
+                reference_lookup[name]
+                for name in self._art_collision_point_link_names
+            ],
             device=self.device,
             dtype=torch.long,
         )
-        if self._art_use_graph:
-            if not self._art_contact_point_links:
-                raise ValueError("articulated_graph requires contact-region points")
-            self._art_graph_reference_link_ids = torch.as_tensor(
-                [reference_lookup[name] for name in self._art_contact_point_links],
-                device=self.device,
-                dtype=torch.long,
-            )
+        if self._art_use_graph and self._art_surface_points.numel() == 0:
+            raise ValueError("articulated_graph requires object-surface points")
 
     def _contact_telemetry(self):
         link_count = len(self._art_target_contact_link_names)
