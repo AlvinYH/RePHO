@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -501,6 +502,10 @@ class RePHOArticulated(InterMimic):
         self._art_rollout_next_frame = None
         self._art_rollout_written = False
         self._art_rollout_terminated = None
+        self._art_rollout_sanity_check = (
+            os.environ.get("REPHO_ROLLOUT_SANITY_CHECK") == "1"
+        )
+        self._art_rollout_legacy_frames = []
         self._art_qref = None
         self._static_box_handles = []
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
@@ -744,16 +749,18 @@ class RePHOArticulated(InterMimic):
             self._art_human_contact_box_valid,
             self._art_human_contact_local_groups,
         )[0]
-        self._art_rollout_frames.append(dict(
-            human_root_state=self._humanoid_root_states[0].detach().cpu().numpy(),
-            human_dof_pos=self._dof_pos[0].detach().cpu().numpy(),
-            human_body_state=body_state.detach().cpu().numpy(),
-            object_root_state=self._target_states[0].detach().cpu().numpy(),
-            object_joint_qpos=self._target_dof_pos[0].detach().cpu().numpy(),
-            region_distance_m=distance.detach().cpu().numpy(),
-            hand_force_n=np.zeros(2, dtype=np.float32),
-            region_force_n=np.zeros(link_count, dtype=np.float32),
-        ))
+        self._append_rollout_frame(
+            human_root_state=self._humanoid_root_states[0],
+            human_dof_pos=self._dof_pos[0],
+            human_body_state=body_state,
+            object_root_state=self._target_states[0],
+            object_joint_qpos=self._target_dof_pos[0],
+            region_distance_m=distance,
+            hand_force_n=torch.zeros(2, dtype=torch.float32, device=self.device),
+            region_force_n=torch.zeros(
+                link_count, dtype=torch.float32, device=self.device
+            ),
+        )
         self._art_rollout_next_frame = 1
 
     def _write_reset_body_cache(self, env_ids):
@@ -1510,6 +1517,25 @@ class RePHOArticulated(InterMimic):
             raise
         self._record_common_rollout_step()
 
+    def _append_rollout_frame(self, **values):
+        """Stage a formal rollout frame on GPU until the episode is complete.
+
+        The legacy recorder synchronized eight tensors from CUDA to NumPy on
+        every physics step.  Keep snapshots on device instead, then copy each
+        field once while publishing the final common rollout archive.
+        """
+
+        if self._art_rollout_sanity_check:
+            self._art_rollout_legacy_frames.append(
+                {
+                    name: value.detach().cpu().numpy().copy()
+                    for name, value in values.items()
+                }
+            )
+        self._art_rollout_frames.append(
+            {name: value.detach().clone() for name, value in values.items()}
+        )
+
     def _record_common_rollout_step(self):
         if not self._art_rollout_path or self._art_rollout_written:
             return
@@ -1523,16 +1549,16 @@ class RePHOArticulated(InterMimic):
                 f"{self._art_rollout_next_frame}, got {frame}"
             )
         body_state = self._rigid_body_state.view(self.num_envs, -1, 13)[0, :self.num_bodies]
-        self._art_rollout_frames.append(dict(
-            human_root_state=self._humanoid_root_states[0].detach().cpu().numpy(),
-            human_dof_pos=self._dof_pos[0].detach().cpu().numpy(),
-            human_body_state=body_state.detach().cpu().numpy(),
-            object_root_state=self._target_states[0].detach().cpu().numpy(),
-            object_joint_qpos=self._target_dof_pos[0].detach().cpu().numpy(),
-            region_distance_m=distance[0].detach().cpu().numpy(),
-            hand_force_n=hand_force[0].detach().cpu().numpy(),
-            region_force_n=region_force[0].detach().cpu().numpy(),
-        ))
+        self._append_rollout_frame(
+            human_root_state=self._humanoid_root_states[0],
+            human_dof_pos=self._dof_pos[0],
+            human_body_state=body_state,
+            object_root_state=self._target_states[0],
+            object_joint_qpos=self._target_dof_pos[0],
+            region_distance_m=distance[0],
+            hand_force_n=hand_force[0],
+            region_force_n=region_force[0],
+        )
         self._art_rollout_next_frame += 1
         if bool(self.reset_buf[0].item()) or frame >= self._art_qref.shape[0] - 1:
             self._write_common_rollout()
@@ -1544,10 +1570,14 @@ class RePHOArticulated(InterMimic):
         if not 1 <= valid_frames <= total_frames:
             raise RuntimeError("RePHO rollout frames do not match the reference")
 
-        def states(name):
-            values = np.stack(
+        def stacked(name):
+            values = torch.stack(
                 [frame[name] for frame in self._art_rollout_frames]
-            ).astype(np.float32)
+            ).detach().cpu().numpy().astype(np.float32)
+            return values
+
+        def states(name):
+            values = stacked(name)
             if valid_frames < total_frames:
                 values = np.concatenate(
                     (
@@ -1562,9 +1592,7 @@ class RePHOArticulated(InterMimic):
             return values
 
         def forces(name):
-            values = np.stack(
-                [frame[name] for frame in self._art_rollout_frames]
-            ).astype(np.float32)
+            values = stacked(name)
             if valid_frames < total_frames:
                 values = np.concatenate(
                     (
@@ -1578,29 +1606,86 @@ class RePHOArticulated(InterMimic):
                 )
             return values
 
+        state_names = (
+            "human_root_state",
+            "human_dof_pos",
+            "human_body_state",
+            "object_root_state",
+            "object_joint_qpos",
+            "region_distance_m",
+        )
+        force_names = ("hand_force_n", "region_force_n")
+        state_values = {name: states(name) for name in state_names}
+        force_values = {name: forces(name) for name in force_names}
+        if self._art_rollout_sanity_check:
+            def legacy_values(name, *, force):
+                values = np.stack(
+                    [frame[name] for frame in self._art_rollout_legacy_frames]
+                ).astype(np.float32)
+                if valid_frames < total_frames:
+                    tail = (
+                        np.zeros(
+                            (total_frames - valid_frames, *values.shape[1:]),
+                            dtype=np.float32,
+                        )
+                        if force
+                        else np.broadcast_to(
+                            values[-1],
+                            (total_frames - valid_frames, *values.shape[1:]),
+                        )
+                    )
+                    values = np.concatenate((values, tail), axis=0)
+                return values
+
+            for name, values in state_values.items():
+                if not np.array_equal(values, legacy_values(name, force=False)):
+                    raise RuntimeError(
+                        f"GPU-staged rollout differs from legacy output: {name}"
+                    )
+            for name, values in force_values.items():
+                if not np.array_equal(values, legacy_values(name, force=True)):
+                    raise RuntimeError(
+                        f"GPU-staged rollout differs from legacy output: {name}"
+                    )
+
         np.savez_compressed(
             self._art_rollout_path,
             fps=np.asarray(self._art_rollout_fps, dtype=np.float32),
             valid_frame_count=np.asarray(valid_frames, dtype=np.int64),
-            human_root_state=states("human_root_state"),
-            human_dof_pos=states("human_dof_pos"),
-            human_body_state=states("human_body_state"),
+            human_root_state=state_values["human_root_state"],
+            human_dof_pos=state_values["human_dof_pos"],
+            human_body_state=state_values["human_body_state"],
             human_body_position_reference=self._art_rollout_reference_body_position,
             human_body_names=np.asarray(self._common_human_body_names),
             human_dof_names=np.asarray(self._common_human_dof_names),
-            object_root_state=states("object_root_state"),
-            object_joint_qpos=states("object_joint_qpos"),
+            object_root_state=state_values["object_root_state"],
+            object_joint_qpos=state_values["object_joint_qpos"],
             object_joint_qpos_reference=self._art_qref_np.astype(np.float32),
             joint_names=np.asarray(self._art_joint_names),
             joint_types=np.asarray(self._art_joint_types),
-            region_distance_m=states("region_distance_m"),
+            region_distance_m=state_values["region_distance_m"],
             intended=np.asarray(self._art_intended_np, dtype=np.bool_),
-            hand_force_n=forces("hand_force_n"),
-            region_force_n=forces("region_force_n"),
+            hand_force_n=force_values["hand_force_n"],
+            region_force_n=force_values["region_force_n"],
             contact_region_link_names=np.asarray(
                 self._art_target_contact_link_names
             ),
         )
+        if self._art_rollout_sanity_check:
+            Path(self._art_rollout_path).with_name(
+                "rollout_recorder_sanity.json"
+            ).write_text(
+                json.dumps(
+                    {
+                        "status": "passed",
+                        "gpu_staging_bitwise_equal": True,
+                        "valid_frame_count": valid_frames,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
 
 __all__ = ["RePHOArticulated"]
