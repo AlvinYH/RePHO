@@ -187,20 +187,29 @@ def _object_creation_pose(root_pos, root_rot, reverse_time):
     return root_pos[frame].copy(), root_rot[frame].copy()
 
 
-def _creation_dof_state(state, initial_qpos, initial_qvel):
-    if state.shape != (len(initial_qpos),):
+def _creation_dof_state(state, qpos, qvel):
+    if state.shape != (len(qpos),):
         raise ValueError(
             "Actor DOF state and reference-frame-0 qpos disagree: "
-            f"{state.shape} vs {initial_qpos.shape}"
+            f"{state.shape} vs {qpos.shape}"
         )
-    if initial_qvel.shape != initial_qpos.shape:
+    if qvel.shape != qpos.shape:
         raise ValueError("Reference-frame-0 qpos and qvel disagree")
     if state.dtype.names is None or not {"pos", "vel"}.issubset(state.dtype.names):
         raise ValueError("Actor DOF state must expose pos/vel fields")
     state = state.copy()
-    state["pos"] = initial_qpos
-    state["vel"] = initial_qvel
+    state["pos"] = qpos
+    state["vel"] = qvel
     return state
+
+
+def _object_reset_state_from_reference(q_reference, frames, *, use_first_frame):
+    """Return the articulated object reset state from its sole q reference."""
+
+    if use_first_frame:
+        frames = torch.zeros_like(frames)
+    qpos = q_reference[frames]
+    return qpos, torch.zeros_like(qpos)
 
 
 class RePHOArticulated(InterMimic):
@@ -336,16 +345,6 @@ class RePHOArticulated(InterMimic):
             ],
             dtype=np.int64,
         )
-        self._art_q0_np = np.asarray(
-            self._art_config["initial_joint_qpos"],
-            dtype=np.float32,
-        ).reshape(-1)
-        if (
-            self._art_q0_np.shape != (len(self._art_joint_names),)
-            or not np.isfinite(self._art_q0_np).all()
-        ):
-            raise ValueError("initial_joint_qpos must be finite and match object joints")
-        self._art_qvel0_np = np.zeros_like(self._art_q0_np)
         self._art_dof_count = len(self._art_joint_names)
         self._art_active_dof_count = len(self._art_active_joint_names)
         self._art_active_link_names = [
@@ -405,10 +404,11 @@ class RePHOArticulated(InterMimic):
             env["numObs"] = self._art_native_obs_size + 4 * self._art_active_dof_count
         if (
             self._art_qref_np.ndim != 2
+            or self._art_qref_np.shape[0] == 0
             or self._art_qref_np.shape[1] != self._art_dof_count
         ):
             raise ValueError(
-                "object_joint_qpos must have shape (frames, object DOFs), got "
+                "object_joint_qpos must have non-empty shape (frames, object DOFs), got "
                 f"{self._art_qref_np.shape} for {self._art_dof_count} DOFs"
             )
         if self._art_link_ref_np.shape != (
@@ -427,6 +427,8 @@ class RePHOArticulated(InterMimic):
             )
         if not np.all(np.isfinite(self._art_qref_np)):
             raise ValueError("Object q reference must be finite")
+        self._art_creation_qpos_np = self._art_qref_np[0].copy()
+        self._art_creation_qvel_np = np.zeros_like(self._art_creation_qpos_np)
         if self._art_intended_np.shape != (self._art_qref_np.shape[0], 2):
             raise ValueError("intended contact must have shape (frames, 2)")
         if self._art_object_surface_mode not in {"active_part", "full_object"}:
@@ -624,8 +626,8 @@ class RePHOArticulated(InterMimic):
         )
         creation_state = _creation_dof_state(
             creation_state,
-            self._art_q0_np,
-            self._art_qvel0_np,
+            self._art_creation_qpos_np,
+            self._art_creation_qvel_np,
         )
         self.gym.set_actor_dof_states(
             env_ptr, handle, creation_state, gymapi.STATE_ALL
@@ -671,11 +673,20 @@ class RePHOArticulated(InterMimic):
 
     def _reset_target(self, env_ids):
         super()._reset_target(env_ids)
-        reset_qpos = to_torch(
-            self._art_q0_np,
-            device=self.device,
-        ).expand(env_ids.shape[0], -1)
-        reset_qvel = torch.zeros_like(reset_qpos)
+        q_reference = self._art_qref
+        if q_reference is None:
+            q_reference = to_torch(self._art_qref_np, device=self.device)
+        frames = torch.clamp(
+            self.progress_buf[env_ids].long(),
+            0,
+            q_reference.shape[0] - 1,
+        )
+        reset_qpos, reset_qvel = _object_reset_state_from_reference(
+            q_reference,
+            frames,
+            use_first_frame=self._state_init
+            in {InterMimic.StateInit.Default, InterMimic.StateInit.Start},
+        )
         self._target_dof_pos[env_ids] = reset_qpos
         self._target_dof_vel[env_ids] = reset_qvel
         if self._art_rollout_terminated is not None:
