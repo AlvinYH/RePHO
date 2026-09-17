@@ -289,7 +289,6 @@ class RePHOArticulated(InterMimic):
             self._art_link_names = [
                 str(value) for value in np.asarray(values["body_names"]).tolist()
             ]
-            self._art_intended_np = np.asarray(values["intended"], dtype=np.bool_)
             self._art_object_surface_mode = str(
                 np.asarray(values["object_surface_mode"]).item()
             )
@@ -318,7 +317,6 @@ class RePHOArticulated(InterMimic):
             self._art_qref_np = self._art_qref_np[::-1].copy()
             self._art_link_ref_np = self._art_link_ref_np[::-1].copy()
             self._art_link_ref_rot_np = self._art_link_ref_rot_np[::-1].copy()
-            self._art_intended_np = self._art_intended_np[::-1].copy()
         self._object_creation_pos_np, self._object_creation_rot_np = _object_creation_pose(
             object_root_pos,
             object_root_rot,
@@ -429,8 +427,6 @@ class RePHOArticulated(InterMimic):
             raise ValueError("Object q reference must be finite")
         self._art_creation_qpos_np = self._art_qref_np[0].copy()
         self._art_creation_qvel_np = np.zeros_like(self._art_creation_qpos_np)
-        if self._art_intended_np.shape != (self._art_qref_np.shape[0], 2):
-            raise ValueError("intended contact must have shape (frames, 2)")
         if self._art_object_surface_mode not in {"active_part", "full_object"}:
             raise ValueError(
                 "object_surface_mode must be 'active_part' or 'full_object'"
@@ -518,7 +514,11 @@ class RePHOArticulated(InterMimic):
         self._art_link_local_rot = torch.as_tensor(
             self._art_link_local_rot_np, device=self.device
         )
-        self._art_intended = torch.as_tensor(self._art_intended_np, device=self.device)
+        self._art_contact_reference = torch.stack(
+            (self.contact_label_left_hand, self.contact_label_right_hand), dim=1
+        ).to(device=self.device)
+        if self._art_contact_reference.shape != (self._art_qref_np.shape[0], 2):
+            raise ValueError("RePHO motion contact must have shape (frames, 2)")
         self._art_active_dof_ids = torch.as_tensor(
             self._art_active_dof_ids_np,
             device=self.device,
@@ -1254,7 +1254,7 @@ class RePHOArticulated(InterMimic):
 
         contact_threshold = 0.1
         frames = self._reference_frame()
-        intended = (self._art_intended[frames] > contact_threshold).float()
+        intended = (self._art_contact_reference[frames] > contact_threshold).float()
         distance, hand_force, link_force = self._contact_telemetry()
         hand_reward, hand_error, live_contact = _object_surface_contact_reward(
             intended=intended,
@@ -1675,7 +1675,7 @@ class RePHOArticulated(InterMimic):
             joint_names=np.asarray(self._art_joint_names),
             joint_types=np.asarray(self._art_joint_types),
             region_distance_m=state_values["region_distance_m"],
-            intended=np.asarray(self._art_intended_np, dtype=np.bool_),
+            intended=self._art_contact_reference.cpu().numpy().astype(np.bool_),
             hand_force_n=force_values["hand_force_n"],
             region_force_n=force_values["region_force_n"],
             contact_region_link_names=np.asarray(
