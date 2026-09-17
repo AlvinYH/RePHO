@@ -58,16 +58,16 @@ class InterMimicAgent(common_agent.CommonAgent):
         if self._normalize_input:
             self._input_mean_std = RunningMeanStd(self._amp_observation_space.shape).to(self.ppo_device)
         self.resume_from = self.config['resume_from']
+        self.schedule_start_epoch = self.config['schedule_start_epoch']
         self.done_indices = []
 
         return
 
     def train(self):
         if self.resume_from != 'None':
-            # try:
             self.restore(self.resume_from)
-            # except:
-                # print('Failed to restore from checkpoint')
+        else:
+            self.epoch_num = self.schedule_start_epoch
         super().train()
 
     def init_tensors(self):

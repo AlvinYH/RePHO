@@ -72,5 +72,5 @@ params:
     bounds_loss_coef: 10
     enable_eps_greedy: False
     resume_from: checkpoints/smplx_teachers_new/student_new.pth
-    # resume_from: None
+    schedule_start_epoch: 53000
     save_intermediate: True

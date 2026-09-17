@@ -27,7 +27,7 @@ _OBJECT_SURFACE_CONTACT_FORCE_N = 0.001
 
 def _object_surface_contact_reward(
     *,
-    intended,
+    required_contact,
     distance,
     hand_force,
     link_force,
@@ -35,16 +35,18 @@ def _object_surface_contact_reward(
     force_threshold,
     missing_weight,
 ):
-    """Reward intended hand contact only when it reaches the active link."""
+    """Reward required hand contact only when it reaches the active link."""
 
-    if intended.shape != hand_force.shape or intended.ndim != 2:
-        raise ValueError("intended and hand_force must share shape (envs, hands)")
-    if distance.ndim != 3 or distance.shape[:2] != intended.shape:
+    if required_contact.shape != hand_force.shape or required_contact.ndim != 2:
+        raise ValueError(
+            "required_contact and hand_force must share shape (envs, hands)"
+        )
+    if distance.ndim != 3 or distance.shape[:2] != required_contact.shape:
         raise ValueError("distance must have shape (envs, hands, object_links)")
-    if link_force.shape != (intended.shape[0], distance.shape[2]):
+    if link_force.shape != (required_contact.shape[0], distance.shape[2]):
         raise ValueError("link_force must have shape (envs, object_links)")
 
-    intended_contact = intended > 0.1
+    required_contact = required_contact > 0.1
     near_link = distance <= distance_threshold
     loaded_hand = hand_force >= force_threshold
     loaded_link = link_force[:, None, :] >= force_threshold
@@ -72,11 +74,11 @@ def _object_surface_contact_reward(
         0.5 * proximity,
     )
     reward = torch.where(
-        intended_contact,
+        required_contact,
         floor + (1.0 - floor) * score,
         torch.ones_like(score),
     )
-    error = (intended_contact & ~live_contact).to(dtype=distance.dtype)
+    error = (required_contact & ~live_contact).to(dtype=distance.dtype)
     return reward, error, live_contact
 
 
@@ -170,7 +172,7 @@ def _load_humanoid_tree(path):
     return parents, np.asarray(offsets, dtype=np.float32)
 
 
-def _object_creation_pose(root_pos, root_rot, reverse_time):
+def _object_creation_pose(root_pos, root_rot):
     if root_pos.ndim != 2 or root_pos.shape[1] != 3:
         raise ValueError(f"object_root_pos must have shape (frames, 3), got {root_pos.shape}")
     if root_rot.shape != (root_pos.shape[0], 4):
@@ -183,8 +185,7 @@ def _object_creation_pose(root_pos, root_rot, reverse_time):
     norm_error = np.max(np.abs(np.linalg.norm(root_rot, axis=1) - 1.0))
     if norm_error > 1e-4:
         raise ValueError(f"Object root quaternion norm error is too large: {norm_error}")
-    frame = -1 if reverse_time else 0
-    return root_pos[frame].copy(), root_rot[frame].copy()
+    return root_pos[0].copy(), root_rot[0].copy()
 
 
 def _creation_dof_state(state, qpos, qvel):
@@ -229,7 +230,6 @@ class RePHOArticulated(InterMimic):
         )
         from pipeline.physics.articulated_scene import (
             ARTICULATED_OBJECT_COLLISION_FILTER,
-            STATIC_SCENE_COLLISION_FILTER,
             add_ground_plane,
             configure_articulated_actor,
             create_static_box_actors,
@@ -246,10 +246,7 @@ class RePHOArticulated(InterMimic):
         )
         manifest_path = Path(env["articulatedInputPath"]).expanduser().resolve()
         self._art_config = json.loads(manifest_path.read_text(encoding="utf-8"))
-        static_collision_filter = self._art_config.get(
-            "static_box_collision_filter",
-            STATIC_SCENE_COLLISION_FILTER,
-        )
+        static_collision_filter = self._art_config["static_box_collision_filter"]
         if (
             isinstance(static_collision_filter, bool)
             or not isinstance(static_collision_filter, int)
@@ -257,70 +254,68 @@ class RePHOArticulated(InterMimic):
         ):
             raise ValueError("static_box_collision_filter must be a non-negative integer")
         self._static_collision_filter = static_collision_filter
-        with np.load(
-            Path(self._art_config["reference_path"]).expanduser().resolve(),
-            allow_pickle=False,
-        ) as values:
-            object_root_pos = np.asarray(values["object_root_pos"], dtype=np.float32)
-            object_root_rot = np.asarray(values["object_root_rot_xyzw"], dtype=np.float32)
-            self._art_qref_np = np.asarray(values["object_joint_qpos"], dtype=np.float32)
-            self._art_joint_types = [
-                str(value) for value in np.asarray(values["joint_types"]).tolist()
-            ]
-            reference_joint_names = [
-                str(value) for value in np.asarray(values["joint_names"]).tolist()
-            ]
-            reference_active_joint_names = [
-                str(value)
-                for value in np.asarray(values["active_joint_names"]).tolist()
-            ]
-            reference_active_parent_names = [
-                str(value)
-                for value in np.asarray(values["active_parent_link_names"]).tolist()
-            ]
-            reference_active_child_names = [
-                str(value)
-                for value in np.asarray(values["active_child_link_names"]).tolist()
-            ]
-            self._art_link_ref_np = np.asarray(values["object_link_pos"], dtype=np.float32)
-            self._art_link_ref_rot_np = np.asarray(
-                values["object_link_rot_xyzw"], dtype=np.float32
+        motion_dir = (
+            Path(env["motion_file"]).expanduser().resolve()
+            / env["sub_file_name"]
+        )
+        motion_path = motion_dir / "intermimic.pt"
+        motion = torch.load(motion_path, map_location="cpu", weights_only=False)
+        self._art_joint_names = [str(value) for value in self._art_config["joint_names"]]
+        self._art_link_names = [str(value) for value in self._art_config["body_names"]]
+        self._art_joint_types = [str(value) for value in self._art_config["joint_types"]]
+        self._art_active_joint_names = [
+            str(value) for value in self._art_config["active_joint_names"]
+        ]
+        self._art_active_link_names = [
+            str(value) for value in self._art_config["active_child_link_names"]
+        ]
+        if (
+            len(self._art_active_joint_names) != 1
+            or len(self._art_active_link_names) != 1
+        ):
+            raise ValueError("RePHO articulated task requires one active joint and link")
+        joint_count = len(self._art_joint_names)
+        link_count = len(self._art_link_names)
+        expected_width = 591 + 13 + 2 * joint_count + 13 * link_count
+        if motion.ndim != 2 or not len(motion) or motion.shape[1] != expected_width:
+            raise ValueError(
+                f"RePHO articulated motion must have shape [T,{expected_width}]"
             )
-            self._art_link_names = [
-                str(value) for value in np.asarray(values["body_names"]).tolist()
-            ]
-            self._art_object_surface_mode = str(
-                np.asarray(values["object_surface_mode"]).item()
-            )
-            self._art_surface_points_np = np.asarray(
-                values["object_surface_points_link_local_scaled"], dtype=np.float32
-            )
-            self._art_surface_link_names = [
-                str(value)
-                for value in np.asarray(
-                    values["object_surface_point_link_names"]
-                ).tolist()
-            ]
-            self._art_collision_points_np = np.asarray(
-                values["collision_surface_points_link_local_scaled"], dtype=np.float32
-            )
-            self._art_collision_point_link_names = [
-                str(value)
-                for value in np.asarray(
-                    values["collision_surface_point_link_names"]
-                ).tolist()
-            ]
-            self._art_reference_fps = float(np.asarray(values["fps"]).item())
-        if bool(env.get("reverse_time", False)):
+        reference = motion[:, 591:].detach().cpu().numpy()
+        root = reference[:, :13]
+        self._art_qref_np = reference[:, 13:13 + joint_count]
+        self._art_qvel_reference_np = reference[
+            :, 13 + joint_count:13 + 2 * joint_count
+        ]
+        links = reference[:, 13 + 2 * joint_count:].reshape(len(motion), link_count, 13)
+        object_root_pos = root[:, :3]
+        object_root_rot = root[:, 3:7]
+        self._art_link_ref_np = links[:, :, :3]
+        self._art_link_ref_rot_np = links[:, :, 3:7]
+        self._art_object_surface_mode = str(self._art_config["object_surface"])
+        self._art_surface_points_np = np.asarray(
+            self._art_config["object_surface_points_link_local_scaled"], dtype=np.float32
+        )
+        self._art_surface_link_names = [
+            str(value) for value in self._art_config["object_surface_point_link_names"]
+        ]
+        self._art_collision_points_np = np.asarray(
+            self._art_config["collision_surface_points_link_local_scaled"], dtype=np.float32
+        )
+        self._art_collision_point_link_names = [
+            str(value) for value in self._art_config["collision_surface_point_link_names"]
+        ]
+        self._art_reference_fps = float(self._art_config["fps"])
+        if env["reverse_time"]:
             object_root_pos = object_root_pos[::-1].copy()
             object_root_rot = object_root_rot[::-1].copy()
             self._art_qref_np = self._art_qref_np[::-1].copy()
+            self._art_qvel_reference_np = -self._art_qvel_reference_np[::-1].copy()
             self._art_link_ref_np = self._art_link_ref_np[::-1].copy()
             self._art_link_ref_rot_np = self._art_link_ref_rot_np[::-1].copy()
         self._object_creation_pos_np, self._object_creation_rot_np = _object_creation_pose(
             object_root_pos,
             object_root_rot,
-            False,
         )
         local_links = _link_poses_in_object_frame(
             {
@@ -332,10 +327,6 @@ class RePHOArticulated(InterMimic):
         )
         self._art_link_local_np = local_links["pos"]
         self._art_link_local_rot_np = local_links["rot"]
-        self._art_joint_names = [str(value) for value in self._art_config["joint_names"]]
-        self._art_active_joint_names = [
-            str(value) for value in self._art_config["active_joint_names"]
-        ]
         self._art_active_dof_ids_np = np.asarray(
             [
                 self._art_joint_names.index(name)
@@ -344,62 +335,12 @@ class RePHOArticulated(InterMimic):
             dtype=np.int64,
         )
         self._art_dof_count = len(self._art_joint_names)
-        self._art_active_dof_count = len(self._art_active_joint_names)
-        self._art_active_link_names = [
-            str(value)
-            for value in self._art_config["active_child_link_names"]
-        ]
-        if (
-            reference_joint_names != self._art_joint_names
-            or self._art_joint_types
-            != [str(value) for value in self._art_config["joint_types"]]
-            or reference_active_joint_names != self._art_active_joint_names
-            or reference_active_parent_names
-            != [
-                str(value)
-                for value in self._art_config["active_parent_link_names"]
-            ]
-            or reference_active_child_names != self._art_active_link_names
-            or self._art_link_names
-            != [str(value) for value in self._art_config["body_names"]]
-        ):
-            raise ValueError("Articulated manifest and reference topology disagree")
-        self._art_observation_variant = env["articulationObservation"]
-        if self._art_observation_variant not in {
-            "rigid_graph",
-            "articulated_graph",
-            "joint_state",
-            "articulated_graph_joint_state",
-        }:
+        self._articulation_obs_dims = 4 * len(self._art_active_joint_names)
+        self._art_native_obs_size = int(env["numObs"]) - self._articulation_obs_dims
+        if self._art_native_obs_size <= 0:
             raise ValueError(
-                f"Unknown articulation observation: {self._art_observation_variant}"
+                "author env numObs is too small for the articulated joint-state block"
             )
-        self._art_use_graph = (
-            self._art_active_dof_count > 0
-            and self._art_observation_variant
-            in {"articulated_graph", "articulated_graph_joint_state"}
-        )
-        self._art_use_joint_state = (
-            self._art_active_dof_count > 0
-            and self._art_observation_variant
-            in {"joint_state", "articulated_graph_joint_state"}
-        )
-        qvel_scale = np.asarray(
-            env["articulationQvelScale"], dtype=np.float32
-        ).reshape(-1)
-        if qvel_scale.size == 1:
-            qvel_scale = np.repeat(qvel_scale, self._art_active_dof_count)
-        if qvel_scale.shape != (self._art_active_dof_count,):
-            raise ValueError(
-                "articulationQvelScale must be scalar or match active object DOFs, got "
-                f"{qvel_scale.shape} for {self._art_active_dof_count} active DOFs"
-            )
-        if not np.all(np.isfinite(qvel_scale)) or np.any(qvel_scale <= 0):
-            raise ValueError("articulationQvelScale must contain finite positive values")
-        self._art_qvel_scale_np = qvel_scale
-        self._art_native_obs_size = int(env["numObs"])
-        if self._art_use_joint_state:
-            env["numObs"] = self._art_native_obs_size + 4 * self._art_active_dof_count
         if (
             self._art_qref_np.ndim != 2
             or self._art_qref_np.shape[0] == 0
@@ -425,6 +366,11 @@ class RePHOArticulated(InterMimic):
             )
         if not np.all(np.isfinite(self._art_qref_np)):
             raise ValueError("Object q reference must be finite")
+        if (
+            self._art_qvel_reference_np.shape != self._art_qref_np.shape
+            or not np.all(np.isfinite(self._art_qvel_reference_np))
+        ):
+            raise ValueError("Object qvel reference must match object q reference")
         self._art_creation_qpos_np = self._art_qref_np[0].copy()
         self._art_creation_qvel_np = np.zeros_like(self._art_creation_qpos_np)
         if self._art_object_surface_mode not in {"active_part", "full_object"}:
@@ -488,9 +434,7 @@ class RePHOArticulated(InterMimic):
             float(self._art_config["ground_height"]),
         ):
             raise ValueError("author ground plane and articulated manifest differ")
-        self._art_humanoid_mjcf_path = Path(
-            env["articulatedHumanoidXmlPath"]
-        ).expanduser().resolve()
+        self._art_humanoid_mjcf_path = motion_dir / "intermimic_humanoid.xml"
         self._art_humanoid_parents, offsets = _load_humanoid_tree(
             self._art_humanoid_mjcf_path
         )
@@ -514,10 +458,10 @@ class RePHOArticulated(InterMimic):
         self._art_link_local_rot = torch.as_tensor(
             self._art_link_local_rot_np, device=self.device
         )
-        self._art_contact_reference = torch.stack(
+        self._art_required_hand_contact = torch.stack(
             (self.contact_label_left_hand, self.contact_label_right_hand), dim=1
         ).to(device=self.device)
-        if self._art_contact_reference.shape != (self._art_qref_np.shape[0], 2):
+        if self._art_required_hand_contact.shape != (self._art_qref_np.shape[0], 2):
             raise ValueError("RePHO motion contact must have shape (frames, 2)")
         self._art_active_dof_ids = torch.as_tensor(
             self._art_active_dof_ids_np,
@@ -528,14 +472,18 @@ class RePHOArticulated(InterMimic):
         upper = np.asarray(self._target_dof_properties["upper"], dtype=np.float32)
         active_lower = lower[self._art_active_dof_ids_np]
         active_range = (upper - lower)[self._art_active_dof_ids_np]
-        if self._art_active_dof_count and (
-            not np.all(np.isfinite(active_range)) or np.any(active_range <= 0)
-        ):
+        if not np.all(np.isfinite(active_range)) or np.any(active_range <= 0):
             raise ValueError("Active object DOFs require finite positive joint ranges")
         self._art_q_lower = torch.as_tensor(active_lower, device=self.device)
         self._art_q_range = torch.as_tensor(active_range, device=self.device)
         self._art_qvel_scale = torch.as_tensor(
-            self._art_qvel_scale_np, device=self.device
+            np.maximum(
+                np.abs(
+                    self._art_qvel_reference_np[:, self._art_active_dof_ids_np]
+                ).max(axis=0),
+                1.0e-6,
+            ),
+            device=self.device,
         )
         if self._art_rollout_path:
             self._art_rollout_terminated = torch.zeros(
@@ -931,15 +879,38 @@ class RePHOArticulated(InterMimic):
             ),
             dim=-1,
         )
-        if self._art_use_joint_state:
-            native = torch.cat(
-                (native, self._art_joint_state_observation(env_ids)), dim=-1
+        if native.shape[-1] != self._art_native_obs_size:
+            raise RuntimeError(
+                "articulated native observation width does not match the author "
+                "numObs implied by the env config"
+            )
+        native = torch.cat((native, self._art_joint_state_observation(env_ids)), dim=-1)
+        if native.shape[-1] != self.obs_buf.shape[-1]:
+            raise RuntimeError(
+                "articulated observation width does not match numObs"
             )
         self.obs_buf[env_ids] = native
 
+    def _art_joint_state_observation(self, env_ids):
+        """Append the active joint state in the author's two-horizon format."""
+
+        q = self._target_dof_pos[env_ids][:, self._art_active_dof_ids]
+        qvel = self._target_dof_vel[env_ids][:, self._art_active_dof_ids]
+        frame = self.progress_buf[env_ids]
+        next_frame = torch.clamp(frame + 1, max=self._art_qref.shape[0] - 1)
+        far_frame = torch.clamp(frame + 16, max=self._art_qref.shape[0] - 1)
+        reference = self._art_qref[:, self._art_active_dof_ids]
+        return torch.cat(
+            (
+                2.0 * (q - self._art_q_lower) / self._art_q_range - 1.0,
+                qvel / self._art_qvel_scale,
+                (reference[next_frame] - q) / self._art_q_range,
+                (reference[far_frame] - q) / self._art_q_range,
+            ),
+            dim=-1,
+        )
+
     def _compute_observations_iter(self, hoi_data, env_ids=None, delta_t=1):
-        if not self._art_use_graph:
-            return super()._compute_observations_iter(hoi_data, env_ids, delta_t)
         if env_ids is None:
             env_ids = to_torch(
                 np.arange(self.num_envs), device=self.device, dtype=torch.long
@@ -961,30 +932,6 @@ class RePHOArticulated(InterMimic):
             env_ids, ref_obs, next_ts
         )
         return torch.cat((obs, ig_all, ref_ig - ig), dim=-1)
-
-    def _art_joint_state_observation(self, env_ids):
-        if self._art_active_dof_count == 0:
-            return self._target_dof_pos[env_ids, :0]
-
-        q = self._target_dof_pos[env_ids][:, self._art_active_dof_ids]
-        qvel = self._target_dof_vel[env_ids][:, self._art_active_dof_ids]
-        frame = self.progress_buf[env_ids]
-        frame_1 = torch.clamp(frame + 1, max=self._art_qref.shape[0] - 1)
-        frame_16 = torch.clamp(frame + 16, max=self._art_qref.shape[0] - 1)
-        normalized_q = 2.0 * (q - self._art_q_lower) / self._art_q_range - 1.0
-        return torch.cat(
-            (
-                normalized_q,
-                qvel / self._art_qvel_scale,
-                (
-                    self._art_qref[frame_1][:, self._art_active_dof_ids] - q
-                ) / self._art_q_range,
-                (
-                    self._art_qref[frame_16][:, self._art_active_dof_ids] - q
-                ) / self._art_q_range,
-            ),
-            dim=-1,
-        )
 
     def _art_graph_observation(self, env_ids, ref_obs, next_ts):
         live_points = self._object_surface_points(
@@ -1202,21 +1149,18 @@ class RePHOArticulated(InterMimic):
             frames, self._curr_ref_obs
         )
         reset = (obj_points - ref_obj_points).norm(dim=-1).mean(dim=-1) > 0.5
-        if self._art_active_dof_count:
-            q_reward = torch.exp(
-                -self._art_q_scale
-                * _mean_normalized_joint_error(
-                    {
-                        "qpos": self._target_dof_pos[:, self._art_active_dof_ids],
-                        "reference": self._art_qref[frames][
-                            :, self._art_active_dof_ids
-                        ],
-                        "range": self._art_q_range,
-                    }
-                )
+        q_reward = torch.exp(
+            -self._art_q_scale
+            * _mean_normalized_joint_error(
+                {
+                    "qpos": self._target_dof_pos[:, self._art_active_dof_ids],
+                    "reference": self._art_qref[frames][
+                        :, self._art_active_dof_ids
+                    ],
+                    "range": self._art_q_range,
+                }
             )
-        else:
-            q_reward = torch.ones(self.num_envs, device=self.device)
+        )
         link_reward = torch.ones_like(q_reward)
         if self._art_live_link_ids.numel() > 0:
             live = self._target_body_state[:, self._art_live_link_ids, :3]
@@ -1254,10 +1198,12 @@ class RePHOArticulated(InterMimic):
 
         contact_threshold = 0.1
         frames = self._reference_frame()
-        intended = (self._art_contact_reference[frames] > contact_threshold).float()
+        required_contact = (
+            self._art_required_hand_contact[frames] > contact_threshold
+        ).float()
         distance, hand_force, link_force = self._contact_telemetry()
         hand_reward, hand_error, live_contact = _object_surface_contact_reward(
-            intended=intended,
+            required_contact=required_contact,
             distance=distance,
             hand_force=hand_force,
             link_force=link_force,
@@ -1468,8 +1414,8 @@ class RePHOArticulated(InterMimic):
             device=self.device,
             dtype=torch.long,
         )
-        if self._art_use_graph and self._art_surface_points.numel() == 0:
-            raise ValueError("articulated_graph requires object-surface points")
+        if self._art_surface_points.numel() == 0:
+            raise ValueError("RePHO requires object-surface points")
 
     def _contact_telemetry(self):
         link_count = len(self._art_target_contact_link_names)
@@ -1675,7 +1621,7 @@ class RePHOArticulated(InterMimic):
             joint_names=np.asarray(self._art_joint_names),
             joint_types=np.asarray(self._art_joint_types),
             region_distance_m=state_values["region_distance_m"],
-            intended=self._art_contact_reference.cpu().numpy().astype(np.bool_),
+            intended=self._art_required_hand_contact.cpu().numpy().astype(np.bool_),
             hand_force_n=force_values["hand_force_n"],
             region_force_n=force_values["region_force_n"],
             contact_region_link_names=np.asarray(
