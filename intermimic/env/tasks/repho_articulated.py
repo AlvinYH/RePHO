@@ -313,6 +313,8 @@ class RePHOArticulated(InterMimic):
             self._art_qvel_reference_np = -self._art_qvel_reference_np[::-1].copy()
             self._art_link_ref_np = self._art_link_ref_np[::-1].copy()
             self._art_link_ref_rot_np = self._art_link_ref_rot_np[::-1].copy()
+        self._art_root_ref_pos_np = object_root_pos.astype(np.float32)
+        self._art_root_ref_rot_np = object_root_rot.astype(np.float32)
         self._object_creation_pos_np, self._object_creation_rot_np = _object_creation_pose(
             object_root_pos,
             object_root_rot,
@@ -1616,12 +1618,19 @@ class RePHOArticulated(InterMimic):
             human_body_names=np.asarray(self._common_human_body_names),
             human_dof_names=np.asarray(self._common_human_dof_names),
             object_root_state=state_values["object_root_state"],
+            object_root_state_reference=np.concatenate(
+                (
+                    self._art_root_ref_pos_np,
+                    self._art_root_ref_rot_np,
+                ),
+                axis=-1,
+            ).astype(np.float32),
             object_joint_qpos=state_values["object_joint_qpos"],
             object_joint_qpos_reference=self._art_qref_np.astype(np.float32),
             joint_names=np.asarray(self._art_joint_names),
             joint_types=np.asarray(self._art_joint_types),
             region_distance_m=state_values["region_distance_m"],
-            intended=self._art_required_hand_contact.cpu().numpy().astype(np.bool_),
+            contact_ref_by_hand=self._art_required_hand_contact.cpu().numpy().astype(np.bool_),
             hand_force_n=force_values["hand_force_n"],
             region_force_n=force_values["region_force_n"],
             contact_region_link_names=np.asarray(
