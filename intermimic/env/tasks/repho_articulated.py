@@ -426,6 +426,7 @@ class RePHOArticulated(InterMimic):
         self._art_q_scale = env["articulationRewardScale"]
         self._art_link_scale = env["articulationLinkRewardScale"]
         self._art_rollout_path = env["commonRolloutOutputPath"]
+        self._art_rollout_region_path = env["commonRolloutContactRegionPath"] if "commonRolloutContactRegionPath" in env else None
         self._art_rollout_fps = self._art_reference_fps
         if self._art_rollout_fps <= 0.0:
             raise ValueError("articulated reference FPS must be positive")
@@ -710,6 +711,18 @@ class RePHOArticulated(InterMimic):
             self._art_human_contact_box_valid,
             self._art_human_contact_local_groups,
         )[0]
+        if self._art_rollout_region is not None:
+            from pipeline.physics.rollout_contact import reference_region_distances
+
+            all_links = _place_links_at_object_root(
+                {"pos": self._target_states[:1, :3], "rot": self._target_states[:1, 3:7]},
+                {"pos": self._art_link_local[frame], "rot": self._art_link_local_rot[frame]},
+            )
+            distance = reference_region_distances(
+                self._art_rollout_region, body_state[None], all_links["pos"],
+                all_links["rot"], self._art_link_names,
+            )[0]
+            link_count = len(self._art_rollout_region["names"])
         self._append_rollout_frame(
             human_root_state=self._humanoid_root_states[0],
             human_dof_pos=self._dof_pos[0],
@@ -1416,6 +1429,17 @@ class RePHOArticulated(InterMimic):
             device=self.device,
             dtype=torch.long,
         )
+        self._art_rollout_region = None
+        if self._art_rollout_region_path:
+            from pipeline.physics.rollout_contact import prepare_rollout_contact
+
+            self._art_rollout_region = prepare_rollout_contact({
+                "region_path": self._art_rollout_region_path,
+                "object_body_names": self._target_asset_body_names,
+                "human_body_names": self._common_human_body_names,
+                "humanoid_xml": self._art_humanoid_mjcf_path,
+                "device": self.device,
+            })
         if self._art_surface_points.numel() == 0:
             raise ValueError("RePHO requires object-surface points")
 
@@ -1498,7 +1522,16 @@ class RePHOArticulated(InterMimic):
     def _record_common_rollout_step(self):
         if not self._art_rollout_path or self._art_rollout_written:
             return
-        distance, hand_force, region_force = self._contact_telemetry()
+        if self._art_rollout_region is None:
+            distance, hand_force, region_force = self._contact_telemetry()
+        else:
+            from pipeline.physics.rollout_contact import measure_rollout_contact
+
+            distance, hand_force, region_force = measure_rollout_contact(
+                self._art_rollout_region,
+                self._rigid_body_state.view(self.num_envs, -1, 13)[:, :self.num_bodies],
+                self._contact_forces, self._target_body_state, self._target_contact_forces,
+            )
         frame = int(self._reference_frame()[0].item())
         if self._art_rollout_next_frame is None:
             return
@@ -1634,7 +1667,7 @@ class RePHOArticulated(InterMimic):
             hand_force_n=force_values["hand_force_n"],
             region_force_n=force_values["region_force_n"],
             contact_region_link_names=np.asarray(
-                self._art_target_contact_link_names
+                self._art_target_contact_link_names if self._art_rollout_region is None else self._art_rollout_region["names"]
             ),
         )
         if self._art_rollout_sanity_check:
